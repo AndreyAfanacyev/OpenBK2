@@ -1,12 +1,17 @@
 #include "stdafx.h"
 
 #include "Artillery.h"
+#include "Building.h"
+#include "Common_RTS_AI/AIMap.h"
 #include "Diplomacy.h"
 #include "GeneralArtillery.h"
+#include "GeneralBotObjectives.h"
 #include "GeneralConsts.h"
 #include "GeneralInternal.h"
 #include "GroupLogic.h"
 #include "Guns.h"
+#include "KeyBuildingBonusSystem.h"
+#include "LinkObject.h"
 #include "NewUpdater.h"
 #include "port/wordpack.h"
 #include "Shell.h"
@@ -26,6 +31,7 @@ extern CDiplomacy theDipl;
 
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4AB, CGeneralArtilleryGoToPosition );
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4AF, CGeneralArtillery );
+REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4F2, CGeneralBotArtillery );
 
 bool HasTruck( CAIUnit *pUnit )
 {
@@ -750,6 +756,448 @@ void CGeneralArtilleryTask::Segment()
 				break;
 			default:
 				NI_ASSERT( false, fmt::format( "Wrong bombardment state ({})", int( eState ) ) );
+		}
+	}
+}
+
+//*******************************************************************
+//*										CGeneralBotArtillery												*
+//*******************************************************************
+extern CKeyBuildingBonusSystem theBonusSystem;
+
+namespace
+{
+// How much of its range away from the focus a gun stands
+const float INDIRECT_RANGE_SHARE = 0.75f;
+const float DIRECT_RANGE_SHARE = 0.6f;
+// Time a gun has to reach its position before it counts as a failed move
+const int GUN_MOVE_TIMEOUT = 180000;
+const int GUN_MAX_FAILED_MOVES = 3;
+const int GUN_MOVE_RETRY = 60000;
+// Between salvos at what is seen, and at a point the enemy holds when nothing is seen
+const int GUN_FIRE_PAUSE = 8000;
+const int GUN_HARASS_PAUSE = 45000;
+// Rockets give their position away: after a salvo they drive this many tiles aside
+const int ROCKET_SCOOT_TILES = 10;
+// Fire at this many tiles from a point rather than at it: wrecking it would make it uncapturable
+const int HARASS_OFFSET_TILES = 8;
+} // namespace
+
+static bool IsTowingGun( CAIUnit *pTractor, const CAIUnit *pGun )
+{
+	const CMilitaryCar *pCar = dynamic_cast<CMilitaryCar *>( pTractor );
+	return pCar && pCar->GetTowedArtillery() == pGun;
+}
+
+CGeneralBotArtillery::CGeneralBotArtillery( CGeneral *_pOwner )
+	: pOwner( _pOwner )
+{
+}
+
+bool CGeneralBotArtillery::TakesUnit( CAIUnit *pUnit )
+{
+	const SUnitBaseRPGStats *pStats = pUnit->GetStats();
+	if ( pStats->IsTransport() )
+	{
+		return pStats->etype == RPG_TYPE_TRN_TRACTOR || pUnit->IsTowing();
+	}
+	return pStats->IsArtillery() || ( pStats->IsSPG() && pUnit->GetFirstArtilleryGun() != 0 );
+}
+
+void CGeneralBotArtillery::Take( CAIUnit *pUnit )
+{
+	if ( pUnit->GetStats()->IsTransport() )
+	{
+		tractors.push_back( pUnit );
+	}
+	else
+	{
+		SGun &gun = guns.emplace_back();
+		gun.pGun = pUnit;
+	}
+}
+
+CGeneralBotArtillery::EGunRole CGeneralBotArtillery::GetRole( const CAIUnit *pGun )
+{
+	switch ( pGun->GetStats()->etype )
+	{
+		case RPG_TYPE_ART_AAGUN:
+		case RPG_TYPE_SPG_AAGUN:
+			return GR_ANTIAIR;
+		case RPG_TYPE_ART_GUN:
+		case RPG_TYPE_ART_HEAVY_MG:
+			return GR_DIRECT;
+		default:
+			return pGun->GetFirstArtilleryGun() ? GR_INDIRECT : GR_DIRECT;
+	}
+}
+
+float CGeneralBotArtillery::GetRange( CAIUnit *pGun )
+{
+	CBasicGun *pWeapon = pGun->GetFirstArtilleryGun();
+	if ( !pWeapon && pGun->GetNGuns() > 0 )
+	{
+		pWeapon = pGun->GetGun( 0 );
+	}
+	return pWeapon ? pWeapon->GetFireRange( 0 ) : 0.0f;
+}
+
+float CGeneralBotArtillery::GetMinRange( CAIUnit *pGun )
+{
+	CBasicGun *pWeapon = pGun->GetFirstArtilleryGun();
+	return pWeapon ? pWeapon->GetWeapon()->fRangeMin : 0.0f;
+}
+
+bool CGeneralBotArtillery::CanRelocateByItself( CAIUnit *pGun )
+{
+	return pGun->CanMove() && pGun->CanCommandBeExecutedByStats( ACTION_COMMAND_MOVE_TO );
+}
+
+bool CGeneralBotArtillery::EnumResistances( const SResistance &resistance )
+{
+	resistanceCenters.push_back( resistance.GetResistanceCellCenter() );
+	return true;
+}
+
+bool CGeneralBotArtillery::FindFocus( const SGun &gun, const EGunRole eRole, CVec2 *pFocus ) const
+{
+	const CVec2 vFrom = gun.pGun->GetCenterPlain();
+	const int nParty = pOwner->GetParty();
+	std::vector<int> links;
+	theBonusSystem.GetKeyBuildingLinks( &links );
+	bool bFound = false;
+	float fBest = 0.0f;
+	for ( int i = 0; i < links.size(); ++i )
+	{
+		CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( links[i] ) );
+		if ( !pBuilding || !pBuilding->IsAlive() )
+		{
+			continue;
+		}
+		// Anti-air guns protect what the side holds, the others support taking what it doesn't
+		const bool bOwn = theDipl.GetNParty( pBuilding->GetPlayer() ) == nParty;
+		if ( bOwn != ( eRole == GR_ANTIAIR ) )
+		{
+			continue;
+		}
+		const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+		const float fDistance = fabs2( vCenter - vFrom );
+		if ( !bFound || fDistance < fBest )
+		{
+			*pFocus = vCenter;
+			fBest = fDistance;
+			bFound = true;
+		}
+	}
+	if ( bFound || eRole == GR_ANTIAIR )
+	{
+		return bFound;
+	}
+
+	// The side holds every point: support the fight against whatever it knows about
+	for ( int i = 0; i < resistanceCenters.size(); ++i )
+	{
+		const float fDistance = fabs2( resistanceCenters[i] - vFrom );
+		if ( !bFound || fDistance < fBest )
+		{
+			*pFocus = resistanceCenters[i];
+			fBest = fDistance;
+			bFound = true;
+		}
+	}
+	return bFound;
+}
+
+bool CGeneralBotArtillery::FindFirePoint( const SGun &gun, CVec2 *pPoint, bool *pbRealTarget ) const
+{
+	const CVec2 vFrom = gun.pGun->GetCenterPlain();
+	const float fRange = GetRange( gun.pGun );
+	const float fMinRange = GetMinRange( gun.pGun );
+
+	// What the side knows about, nearest first
+	bool bFound = false;
+	float fBest = 0.0f;
+	for ( int i = 0; i < resistanceCenters.size(); ++i )
+	{
+		const float fDistance = fabs( resistanceCenters[i] - vFrom );
+		if ( NBotObjectives::IsAtFireDistance( fDistance, fRange / 0.95f, fMinRange ) && ( !bFound || fDistance < fBest ) )
+		{
+			*pPoint = resistanceCenters[i];
+			*pbRealTarget = true;
+			fBest = fDistance;
+			bFound = true;
+		}
+	}
+	if ( bFound )
+	{
+		return true;
+	}
+
+	// Nothing seen: keep the ground around an enemy point under occasional fire
+	const int nParty = pOwner->GetParty();
+	std::vector<int> links;
+	theBonusSystem.GetKeyBuildingLinks( &links );
+	for ( int i = 0; i < links.size(); ++i )
+	{
+		CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( links[i] ) );
+		if ( !pBuilding || !pBuilding->IsAlive() )
+		{
+			continue;
+		}
+		const int nOwnerParty = theDipl.GetNParty( pBuilding->GetPlayer() );
+		if ( nOwnerParty == nParty || nOwnerParty == theDipl.GetNeutralParty() )
+		{
+			continue;
+		}
+		const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+		CVec2 vDir = vCenter - vFrom;
+		const float fLength = fabs( vDir );
+		if ( fLength < 1.0f )
+		{
+			continue;
+		}
+		const CVec2 vPoint = vCenter - vDir / fLength * float( HARASS_OFFSET_TILES * SConsts::TILE_SIZE );
+		const float fDistance = fabs( vPoint - vFrom );
+		if ( NBotObjectives::IsAtFireDistance( fDistance, fRange / 0.95f, fMinRange ) && ( !bFound || fDistance < fBest ) )
+		{
+			*pPoint = vPoint;
+			*pbRealTarget = false;
+			fBest = fDistance;
+			bFound = true;
+		}
+	}
+	return bFound;
+}
+
+CAIUnit *CGeneralBotArtillery::FindTractor( const SGun &gun ) const
+{
+	if ( IsValidObj( gun.pTractor ) )
+	{
+		return gun.pTractor;
+	}
+
+	// One that already has this gun in tow, otherwise the nearest not working for another gun
+	CAIUnit *pBest = 0;
+	float fBest = 0.0f;
+	for ( int i = 0; i < tractors.size(); ++i )
+	{
+		CAIUnit *pTractor = tractors[i];
+		if ( !IsValidObj( pTractor ) )
+		{
+			continue;
+		}
+		if ( IsTowingGun( pTractor, gun.pGun ) )
+		{
+			return pTractor;
+		}
+		bool bBusy = pTractor->IsTowing();
+		for ( int j = 0; j < guns.size() && !bBusy; ++j )
+		{
+			bBusy = guns[j].pTractor.GetPtr() == pTractor;
+		}
+		const float fDistance = fabs2( pTractor->GetCenterPlain() - gun.pGun->GetCenterPlain() );
+		if ( !bBusy && ( !pBest || fDistance < fBest ) )
+		{
+			pBest = pTractor;
+			fBest = fDistance;
+		}
+	}
+	return pBest;
+}
+
+void CGeneralBotArtillery::MoveGun( SGun *pGun, const CVec2 &vWanted )
+{
+	// Stay on the map
+	const float fMaxX = GetAIMap()->GetSizeX() * SConsts::TILE_SIZE - SConsts::TILE_SIZE;
+	const float fMaxY = GetAIMap()->GetSizeY() * SConsts::TILE_SIZE - SConsts::TILE_SIZE;
+	const float fMin = SConsts::TILE_SIZE;
+	const CVec2 vDestination( (std::min)( (std::max)( vWanted.x, fMin ), fMaxX ), (std::min)( (std::max)( vWanted.y, fMin ), fMaxY ) );
+
+	CAIUnit *pTractor = FindTractor( *pGun );
+	pGun->pTractor = pTractor;
+	if ( pTractor )
+	{
+		// The same pair of orders a gun gives its own transport (see CArtilleryMoveToState)
+		if ( !IsTowingGun( pTractor, pGun->pGun ) )
+		{
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_TAKE_ARTILLERY, pGun->pGun->GetUniqueId() ), pTractor, false );
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_DEPLOY_ARTILLERY, vDestination ), pTractor, true );
+		}
+		else
+		{
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_DEPLOY_ARTILLERY, vDestination ), pTractor, false );
+		}
+	}
+	else if ( CanRelocateByItself( pGun->pGun ) )
+	{
+		theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_MOVE_TO, vDestination ), pGun->pGun, false );
+	}
+	else
+	{
+		// Nothing can move it for now: it fires at what it can reach from here
+		pGun->timeNextMove = curTime + GUN_MOVE_RETRY;
+		return;
+	}
+
+	pGun->vDestination = vDestination;
+	pGun->eState = GS_MOVING;
+	pGun->timeStateEnd = curTime + GUN_MOVE_TIMEOUT;
+}
+
+void CGeneralBotArtillery::SegmentReady( SGun *pGun )
+{
+	const EGunRole eRole = GetRole( pGun->pGun );
+	const CVec2 vFrom = pGun->pGun->GetCenterPlain();
+	const float fRange = GetRange( pGun->pGun );
+	const float fMinRange = GetMinRange( pGun->pGun );
+
+	// A gun still in tow can't fire, even if it happens to be in range already: it has to be set down.
+	const bool bInTow = IsArtilleryBeingTowed( pGun->pGun );
+	CVec2 vFocus;
+	if ( curTime >= pGun->timeNextMove && fRange > 0.0f && FindFocus( *pGun, eRole, &vFocus ) )
+	{
+		const float fShare = eRole == GR_INDIRECT ? INDIRECT_RANGE_SHARE : DIRECT_RANGE_SHARE;
+		const float fDistance = fabs( vFocus - vFrom );
+		// Anti-air guns just stand near the point. The others keep their distance to it.
+		const float fOutermost = eRole == GR_INDIRECT ? fRange : fRange * DIRECT_RANGE_SHARE / 0.95f * 1.25f;
+		if ( !NBotObjectives::IsAtFireDistance( fDistance, fOutermost, fMinRange ) )
+		{
+			MoveGun( pGun, NBotObjectives::FirePosition( vFocus, vFrom, fRange, fMinRange, fShare ) );
+		}
+		else if ( bInTow )
+		{
+			MoveGun( pGun, vFrom );
+		}
+	}
+	else if ( bInTow && curTime >= pGun->timeNextMove )
+	{
+		MoveGun( pGun, vFrom ); // nothing to go to yet, but a gun in tow is no use to anyone
+	}
+	if ( pGun->eState == GS_MOVING )
+	{
+		return;
+	}
+
+	// Direct fire guns shoot at what comes into range by themselves
+	if ( eRole != GR_INDIRECT || curTime < pGun->timeNextFire || !pGun->pGun->IsInstalled() )
+	{
+		return;
+	}
+
+	CVec2 vPoint;
+	bool bRealTarget = false;
+	if ( FindFirePoint( *pGun, &vPoint, &bRealTarget ) )
+	{
+		pGun->vFirePoint = vPoint;
+		pGun->bAtRealTarget = bRealTarget;
+		if ( !pGun->pGun->GetFirstArtilleryGun()->CanShootToPointWOMove( vPoint, 0 ) )
+		{
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_ROTATE_TO, vPoint ), pGun->pGun, false );
+		}
+		pGun->eState = GS_AIMING;
+		pGun->timeStateEnd = curTime + 1500;
+	}
+}
+
+void CGeneralBotArtillery::SegmentMoving( SGun *pGun )
+{
+	const bool bGunFree = IsArtilleryFree( pGun->pGun );
+	const bool bTractorFree = !IsValidObj( pGun->pTractor ) || IsArtilleryFree( pGun->pTractor );
+	const bool bTimedOut = curTime >= pGun->timeStateEnd;
+	if ( ( bGunFree && bTractorFree ) || bTimedOut )
+	{
+		pGun->eState = GS_READY;
+		if ( fabs( pGun->pGun->GetCenterPlain() - pGun->vDestination ) > 10.0f * SConsts::TILE_SIZE )
+		{
+			// Didn't get there. A few tries, then fire from where it is for a while.
+			if ( ++pGun->nFailedMoves >= GUN_MAX_FAILED_MOVES )
+			{
+				pGun->nFailedMoves = 0;
+				pGun->timeNextMove = curTime + GUN_MOVE_RETRY;
+			}
+		}
+		else
+		{
+			pGun->nFailedMoves = 0;
+		}
+	}
+}
+
+void CGeneralBotArtillery::SegmentAiming( SGun *pGun )
+{
+	if ( curTime < pGun->timeStateEnd || !IsArtilleryFree( pGun->pGun ) || !pGun->pGun->IsInstalled() )
+	{
+		return;
+	}
+
+	theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_ART_BOMBARDMENT, pGun->vFirePoint ), pGun->pGun, false );
+	CBasicGun *pWeapon = pGun->pGun->GetFirstArtilleryGun();
+	pGun->eState = GS_FIRING;
+	pGun->timeStateEnd =
+			curTime + ( pWeapon->GetAimTime( false ) + pWeapon->GetRelaxTime( false ) ) * SGeneralConsts::SHOOTS_OF_ARTILLERY_FIRE;
+}
+
+void CGeneralBotArtillery::SegmentFiring( SGun *pGun )
+{
+	if ( curTime < pGun->timeStateEnd )
+	{
+		return;
+	}
+
+	theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_STOP ), pGun->pGun, false );
+	pGun->eState = GS_READY;
+	pGun->timeNextFire = curTime + ( pGun->bAtRealTarget ? GUN_FIRE_PAUSE : GUN_HARASS_PAUSE );
+
+	// Rockets drive away from where they were seen firing
+	if ( pGun->pGun->GetStats()->etype == RPG_TYPE_ART_ROCKET || pGun->pGun->GetStats()->IsSPG() )
+	{
+		if ( CanRelocateByItself( pGun->pGun ) && !IsValidObj( pGun->pTractor ) )
+		{
+			CVec2 vDir = pGun->vFirePoint - pGun->pGun->GetCenterPlain();
+			Normalize( &vDir );
+			// Sideways, to a side that comes out the same on every client
+			const float fSide = pGun->pGun->GetUniqueId() % 2 == 0 ? 1.0f : -1.0f;
+			MoveGun( pGun, pGun->pGun->GetCenterPlain() + CVec2( -vDir.y, vDir.x ) * fSide * float( ROCKET_SCOOT_TILES * SConsts::TILE_SIZE ) );
+		}
+	}
+}
+
+void CGeneralBotArtillery::Segment()
+{
+	for ( int i = guns.size() - 1; i >= 0; --i )
+	{
+		if ( !IsValidObj( guns[i].pGun ) || guns[i].pGun->GetPlayer() != pOwner->GetPlayer() )
+		{
+			guns.erase( guns.begin() + i );
+		}
+	}
+	for ( int i = tractors.size() - 1; i >= 0; --i )
+	{
+		if ( !IsValidObj( tractors[i] ) )
+		{
+			tractors.erase( tractors.begin() + i );
+		}
+	}
+
+	resistanceCenters.clear();
+	pOwner->GiveResistances( this );
+
+	for ( int i = 0; i < guns.size(); ++i )
+	{
+		switch ( guns[i].eState )
+		{
+			case GS_READY:
+				SegmentReady( &guns[i] );
+				break;
+			case GS_MOVING:
+				SegmentMoving( &guns[i] );
+				break;
+			case GS_AIMING:
+				SegmentAiming( &guns[i] );
+				break;
+			case GS_FIRING:
+				SegmentFiring( &guns[i] );
+				break;
 		}
 	}
 }

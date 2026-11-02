@@ -339,20 +339,58 @@ class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerat
 {
 	OBJECT_BASIC_METHODS( CGeneralTaskCaptureKeyPoints );
 
+	enum EWorkerRole
+	{
+		WR_GATHERING, // on its way to the rally point, or waiting there for enough others
+		WR_WAVE,      // attacking with its group
+		WR_GARRISON,  // holding a key point the side has taken
+		WR_RETREAT,   // too damaged to fight: back to the rally point, where trucks can reach it
+	};
+
 	struct SWorker
 	{
 		ZDATA
 		CPtr<CCommonUnit> pUnit;
 		CVec2 vTarget;
 		bool bHasTarget = {};
+		EWorkerRole eRole = WR_GATHERING;
+		int nWave = -1;
+		NTimer::STime timeRetreatEnd = {};
+		bool bDugIn = {};
 
 		ZEND int operator&( IBinSaver &f )
 		{
 			f.Add( 2, &pUnit );
 			f.Add( 3, &vTarget );
 			f.Add( 4, &bHasTarget );
+			f.Add( 5, &eRole );
+			f.Add( 6, &nWave );
+			f.Add( 7, &timeRetreatEnd );
+			f.Add( 8, &bDugIn );
 			return 0;
 		}
+	};
+
+	struct SWave
+	{
+		ZDATA
+		int nID = {};
+		CVec2 vTarget;
+
+		ZEND int operator&( IBinSaver &f )
+		{
+			f.Add( 2, &nID );
+			f.Add( 3, &vTarget );
+			return 0;
+		}
+	};
+
+	// What the task knows about one objective during a round of orders
+	struct STarget
+	{
+		CVec2 vCenter;
+		bool bContested = false; // enemies hold it or stand near it
+		bool bUrgent = false;    // a point of ours under attack
 	};
 
 	// An engineer truck at work on a damaged key point
@@ -379,6 +417,12 @@ class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerat
 	std::vector<SRepair> repairs;
 	std::vector<int> pointsToRepair; // links of damaged key points with no truck on the way
 	det_map<int, NTimer::STime> unreachablePoints; // link -> when to try repairing it again
+	std::vector<SWave> waves;
+	int nNextWaveID = {};
+	NTimer::STime timeGatheringStarted = {};
+	CVec2 vRallyPoint;
+	bool bHasRallyPoint = {};
+	bool bGatheringStarted = {};
 
 	ZEND int operator&( IBinSaver &f ) override
 	{
@@ -388,14 +432,27 @@ class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerat
 		f.Add( 5, &repairs );
 		f.Add( 6, &pointsToRepair );
 		f.Add( 7, &unreachablePoints );
+		f.Add( 8, &waves );
+		f.Add( 9, &nNextWaveID );
+		f.Add( 10, &timeGatheringStarted );
+		f.Add( 11, &vRallyPoint );
+		f.Add( 12, &bHasRallyPoint );
+		f.Add( 13, &bGatheringStarted );
 		return 0;
 	}
 
 	std::vector<CVec2> resistanceCenters; // only filled while enumerating, see EnumResistances
 
-	void CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints );
+	void CollectTargets( std::vector<STarget> *pTargets, std::vector<CVec2> *pOwnPoints );
+	void UpdateRallyPoint( const std::vector<STarget> &targets, const std::vector<CVec2> &ownPoints );
+	void UpdateRetreats();
+	void UpdateGarrisons( const std::vector<CVec2> &ownPoints );
+	void UpdateWaves( const std::vector<STarget> &targets );
+	void LaunchWaves( const std::vector<STarget> &targets );
+	void SendWorkers();
 	void GiveOrders();
 	void UpdateRepairs();
+	float GetEnemyStrengthNear( const CVec2 &vCenter, const float fRadius ) const;
 
 public:
 	CGeneralTaskCaptureKeyPoints() {}

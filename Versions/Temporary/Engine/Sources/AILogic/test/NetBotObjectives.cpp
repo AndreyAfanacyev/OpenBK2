@@ -129,3 +129,109 @@ TEST( NetBotDiplomacy, WithoutBotsANetGameHasNoAIPlayersAndSinglePlayerIsUnchang
 	EXPECT_FALSE( dipl.IsAIPlayer( 0 ) );
 	EXPECT_TRUE( dipl.IsAIPlayer( 1 ) );
 }
+
+TEST( NetBotGarrison, ASmallArmyLeavesOneUnitAndNeverMoreThanAThird )
+{
+	using NBotObjectives::GarrisonPerPoint;
+	EXPECT_EQ( GarrisonPerPoint( 3, 1 ), 1 );
+	EXPECT_EQ( GarrisonPerPoint( 7, 1 ), 1 );
+	EXPECT_EQ( GarrisonPerPoint( 9, 1 ), 2 );
+	EXPECT_EQ( GarrisonPerPoint( 9, 3 ), 1 );
+	EXPECT_EQ( GarrisonPerPoint( 2, 1 ), 0 ) << "too few units to spare any";
+	EXPECT_EQ( GarrisonPerPoint( 10, 0 ), 0 );
+}
+
+TEST( NetBotWaves, AFreePointIsTakenEarlyAndADefendedOneNeedsAGroup )
+{
+	using NBotObjectives::ShouldLaunchWave;
+	EXPECT_TRUE( ShouldLaunchWave( 2, false, false, 0 ) );
+	EXPECT_FALSE( ShouldLaunchWave( 1, false, false, 0 ) );
+	EXPECT_TRUE( ShouldLaunchWave( 1, false, false, NBotObjectives::WAVE_WAIT_FREE_POINT ) );
+
+	EXPECT_FALSE( ShouldLaunchWave( 5, true, false, 0 ) );
+	EXPECT_TRUE( ShouldLaunchWave( 6, true, false, 0 ) );
+	EXPECT_FALSE( ShouldLaunchWave( 2, true, false, NBotObjectives::WAVE_WAIT_SHORT ) );
+	EXPECT_TRUE( ShouldLaunchWave( 3, true, false, NBotObjectives::WAVE_WAIT_SHORT ) );
+	EXPECT_TRUE( ShouldLaunchWave( 1, true, false, NBotObjectives::WAVE_WAIT_LONG ) ) << "must not wait forever";
+}
+
+TEST( NetBotWaves, APointUnderAttackCantWaitButNobodyGoesAlone )
+{
+	EXPECT_TRUE( NBotObjectives::ShouldLaunchWave( 1, true, true, 0 ) );
+	EXPECT_FALSE( NBotObjectives::ShouldLaunchWave( 0, true, true, 1000000 ) );
+}
+
+TEST( NetBotWaves, ADividedArmySendsSomethingToEachPoint )
+{
+	EXPECT_EQ( NBotObjectives::WaveSize( 7, 1 ), 7 );
+	EXPECT_EQ( NBotObjectives::WaveSize( 7, 2 ), 3 );
+	EXPECT_EQ( NBotObjectives::WaveSize( 1, 3 ), 1 );
+}
+
+TEST( NetBotRetreat, OnlyAMuchStrongerEnemyTurnsAWaveBack )
+{
+	EXPECT_FALSE( NBotObjectives::ShouldWaveRetreat( 100.0f, 200.0f ) );
+	EXPECT_TRUE( NBotObjectives::ShouldWaveRetreat( 100.0f, 201.0f ) );
+	EXPECT_FALSE( NBotObjectives::ShouldWaveRetreat( 0.0f, 500.0f ) );
+}
+
+TEST( NetBotForces, EngineersWaitUntilThereIsAnArmy )
+{
+	NBotObjectives::SForces forces;
+	EXPECT_FALSE( NBotObjectives::MayCallEngineers( forces ) ) << "no fighting units at all";
+	forces.own[NBotObjectives::FC_ARMOR] = 3.0f;
+	EXPECT_FALSE( NBotObjectives::MayCallEngineers( forces ) );
+	forces.own[NBotObjectives::FC_INFANTRY] = 1.0f;
+	EXPECT_TRUE( NBotObjectives::MayCallEngineers( forces ) );
+}
+
+TEST( NetBotForces, TheMixFollowsWhatTheEnemyFields )
+{
+	using namespace NBotObjectives;
+	const bool all[FC_COUNT] = { true, true, true, true, true };
+
+	SForces fresh;
+	EXPECT_EQ( ChooseCategory( fresh, all ), FC_ARMOR ) << "the largest share of an empty army";
+
+	SForces againstArmor;
+	againstArmor.own[FC_ARMOR] = 4.0f;
+	againstArmor.own[FC_INFANTRY] = 3.0f;
+	againstArmor.enemyArmor = 10.0f;
+	EXPECT_EQ( ChooseCategory( againstArmor, all ), FC_ANTITANK );
+
+	SForces againstAir;
+	againstAir.own[FC_ARMOR] = 4.0f;
+	againstAir.own[FC_INFANTRY] = 3.0f;
+	againstAir.enemyAir = 10.0f;
+	EXPECT_EQ( ChooseCategory( againstAir, all ), FC_ANTIAIR );
+}
+
+TEST( NetBotForces, OnlyWhatCanBeCalledIsChosen )
+{
+	using namespace NBotObjectives;
+	const bool onlyInfantry[FC_COUNT] = { true, false, false, false, false };
+	const bool nothing[FC_COUNT] = {};
+	SForces forces;
+	EXPECT_EQ( ChooseCategory( forces, onlyInfantry ), FC_INFANTRY );
+	EXPECT_EQ( ChooseCategory( forces, nothing ), FC_NOT_COMBAT );
+}
+
+TEST( NetBotArtillery, AGunStandsWithinRangeButBehindTheFront )
+{
+	using namespace NBotObjectives;
+	const CVec2 vFocus( 1000, 1000 );
+	const CVec2 vPosition = FirePosition( vFocus, CVec2( 0, 1000 ), 800.0f, 0.0f, 0.75f );
+	EXPECT_NEAR( vPosition.x, 400.0f, 0.01f ) << "on the near side of the focus";
+	EXPECT_NEAR( vPosition.y, 1000.0f, 0.01f );
+}
+
+TEST( NetBotArtillery, AGunNeverStandsCloserThanItCanFire )
+{
+	using namespace NBotObjectives;
+	const CVec2 vPosition = FirePosition( CVec2( 1000, 0 ), CVec2( 0, 0 ), 100.0f, 500.0f, 0.75f );
+	EXPECT_NEAR( fabs( vPosition - CVec2( 1000, 0 ) ), 600.0f, 0.01f );
+	EXPECT_FALSE( IsAtFireDistance( 400.0f, 1000.0f, 500.0f ) );
+	EXPECT_TRUE( IsAtFireDistance( 600.0f, 1000.0f, 500.0f ) );
+	EXPECT_FALSE( IsAtFireDistance( 990.0f, 1000.0f, 500.0f ) ) << "at the very edge of range";
+}
+

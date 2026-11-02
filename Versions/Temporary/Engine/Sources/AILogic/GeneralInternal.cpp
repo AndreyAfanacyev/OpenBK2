@@ -170,6 +170,10 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
 			{
 				pAirForce->Give( pUnit );
 			}
+			else if ( pBotArtillery && pBotArtillery->TakesUnit( pUnit ) )
+			{
+				pBotArtillery->Take( pUnit );
+			}
 			// дальнобойные орудия
 			else if ( pUnit->GetFirstArtilleryGun() != 0 )
 			{
@@ -276,6 +280,10 @@ void CGeneral::Segment()
 		// бомбардировака областей
 		BombardmentSegment();
 		pGeneralArtillery->Segment();
+		if ( pBotArtillery )
+		{
+			pBotArtillery->Segment();
+		}
 		if ( pIntendant )
 		{
 			pIntendant->Segment();
@@ -706,6 +714,7 @@ void CGeneral::Init()
 
 	if ( theDipl.IsNetGame() )
 	{
+		pBotArtillery = new CGeneralBotArtillery( this );
 		// Key points decide a multiplayer match. This task also attacks known resistance,
 		// so the swarm task would only compete with it for the same units.
 		tasks.push_back( new CGeneralTaskCaptureKeyPoints( this ) );

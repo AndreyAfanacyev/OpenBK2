@@ -1020,9 +1020,26 @@ const int BOT_ORDERS_PERIOD_RANDOM = 2000;
 
 // A neutral key point under this share of its health can't be captured (see CBuildingSimple::Segment)
 const float BOT_CAPTURABLE_HEALTH = 0.9f;
-const int BOT_MAX_REPAIR_TRUCKS = 3;
+const int BOT_MAX_REPAIR_TRUCKS = 2;
 const int BOT_MAX_REPAIR_ORDERS = 5;
 const int BOT_UNREACHABLE_POINT_RETRY = 120000;
+const int BOT_MAX_WAVES = 3;
+const float BOT_RALLY_RADIUS = 300.0f;
+const float BOT_GARRISON_RADIUS = 400.0f;
+const int BOT_RETREAT_TIME = 60000;
+
+// Share of its health a unit has left; for a squad, the share of its soldiers.
+static float GetUnitHealth( const CCommonUnit *pUnit )
+{
+	if ( pUnit->IsFormation() )
+	{
+		const CFormation *pFormation = checked_cast<const CFormation *>( pUnit );
+		const int nFull = pFormation->GetStats()->members.size();
+		return nFull > 0 ? float( pFormation->Size() ) / float( nFull ) : 1.0f;
+	}
+	const CAIUnit *pAIUnit = checked_cast<const CAIUnit *>( pUnit );
+	return pAIUnit->GetStats()->fMaxHP > 0.0f ? pAIUnit->GetHitPoints() / pAIUnit->GetStats()->fMaxHP : 1.0f;
+}
 
 static CBuilding *GetKeyBuilding( const int nLink )
 {
@@ -1100,6 +1117,8 @@ void CGeneralTaskCaptureKeyPoints::UpdateRepairs()
 		SRepair &repair = repairs[i];
 		if ( !IsValidObj( repair.pTruck ) )
 		{
+			// Lost on the way: sending the next one straight after it would only lose that too.
+			unreachablePoints[repair.nLink] = curTime + BOT_UNREACHABLE_POINT_RETRY;
 			repairs.erase( repairs.begin() + i );
 			continue;
 		}
@@ -1190,7 +1209,22 @@ bool CGeneralTaskCaptureKeyPoints::EnumResistances( const SResistance &resistanc
 	return true;
 }
 
-void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints )
+float CGeneralTaskCaptureKeyPoints::GetEnemyStrengthNear( const CVec2 &vCenter, const float fRadius ) const
+{
+	const int nParty = pOwner->GetParty();
+	float fStrength = 0.0f;
+	for ( CUnitsIter<0, 3> iter( nParty, EDI_ENEMY, vCenter, fRadius ); !iter.IsFinished(); iter.Iterate() )
+	{
+		// A bot only reacts to what its side can really see.
+		if ( ( *iter )->IsAlive() && ( *iter )->IsVisible( nParty ) && !( *iter )->GetStats()->IsAviation() )
+		{
+			fStrength += ( *iter )->GetPriceMax();
+		}
+	}
+	return fStrength;
+}
+
+void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<STarget> *pTargets, std::vector<CVec2> *pOwnPoints )
 {
 	const int nParty = pOwner->GetParty();
 	// Without engineers on the way or on call, standing at a wrecked point would achieve nothing.
@@ -1205,25 +1239,25 @@ void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets,
 			continue;
 		}
 
-		const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+		STarget target;
+		target.vCenter = CVec2( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+		const bool bEnemiesNear = GetEnemyStrengthNear( target.vCenter, BOT_THREAT_RADIUS ) > 0.0f;
 		const int nOwnerParty = theDipl.GetNParty( pBuilding->GetPlayer() );
 		if ( nOwnerParty == nParty )
 		{
-			pOwnPoints->push_back( vCenter );
-			for ( CUnitsIter<0, 3> iter( nParty, EDI_ENEMY, vCenter, BOT_THREAT_RADIUS ); !iter.IsFinished(); iter.Iterate() )
+			pOwnPoints->push_back( target.vCenter );
+			if ( bEnemiesNear )
 			{
-				// Visibility check: a bot only reacts to what its side can really see.
-				if ( ( *iter )->IsAlive() && ( *iter )->IsVisible( nParty ) && !( *iter )->GetStats()->IsAviation() )
-				{
-					pTargets->push_back( vCenter );
-					break;
-				}
+				target.bContested = true;
+				target.bUrgent = true;
+				pTargets->push_back( target );
 			}
 		}
 		else if ( !IsBlockedByDamage( pBuilding ) || bCanRepair )
 		{
 			// A damaged point too: the units hold it for the engineers and capture it once repaired.
-			pTargets->push_back( vCenter );
+			target.bContested = bEnemiesNear || nOwnerParty != theDipl.GetNeutralParty();
+			pTargets->push_back( target );
 		}
 	}
 
@@ -1232,57 +1266,376 @@ void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets,
 	{
 		resistanceCenters.clear();
 		pOwner->GiveResistances( this );
-		pTargets->insert( pTargets->end(), resistanceCenters.begin(), resistanceCenters.end() );
+		for ( int i = 0; i < resistanceCenters.size(); ++i )
+		{
+			STarget target;
+			target.vCenter = resistanceCenters[i];
+			target.bContested = true;
+			pTargets->push_back( target );
+		}
 		resistanceCenters.clear();
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::UpdateRallyPoint( const std::vector<STarget> &targets,
+                                                     const std::vector<CVec2> &ownPoints )
+{
+	// Our point closest to where the fighting will be
+	if ( !ownPoints.empty() )
+	{
+		const CVec2 vFront = targets.empty() ? ownPoints.front() : targets.front().vCenter;
+		vRallyPoint = ownPoints.front();
+		float fBest = fabs2( vRallyPoint - vFront );
+		for ( int i = 1; i < ownPoints.size(); ++i )
+		{
+			const float fDistance = fabs2( ownPoints[i] - vFront );
+			if ( fDistance < fBest )
+			{
+				fBest = fDistance;
+				vRallyPoint = ownPoints[i];
+			}
+		}
+		bHasRallyPoint = true;
+		return;
+	}
+
+	// None yet: the middle of whoever is gathering, usually where they arrived
+	CVec2 vSum = VNULL2;
+	int nCount = 0;
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		if ( workers[i].eRole == WR_GATHERING )
+		{
+			vSum += workers[i].pUnit->GetCenterPlain();
+			++nCount;
+		}
+	}
+	if ( nCount > 0 )
+	{
+		vRallyPoint = vSum / float( nCount );
+		bHasRallyPoint = true;
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::UpdateRetreats()
+{
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		SWorker &worker = workers[i];
+		const float fHealth = GetUnitHealth( worker.pUnit );
+		if ( worker.eRole == WR_RETREAT )
+		{
+			if ( fHealth >= NBotObjectives::RETURN_HEALTH || curTime >= worker.timeRetreatEnd )
+			{
+				worker.eRole = WR_GATHERING;
+				worker.bHasTarget = false;
+			}
+		}
+		else if ( fHealth < NBotObjectives::RETREAT_HEALTH && worker.pUnit->CanMove() && bHasRallyPoint &&
+		          fabs( worker.pUnit->GetCenterPlain() - vRallyPoint ) > BOT_RALLY_RADIUS )
+		{
+			worker.eRole = WR_RETREAT;
+			worker.nWave = -1;
+			worker.bDugIn = false;
+			worker.timeRetreatEnd = curTime + BOT_RETREAT_TIME;
+			worker.vTarget = vRallyPoint;
+			worker.bHasTarget = true;
+			// A plain move: a unit running for repairs doesn't stop to fight on the way.
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_MOVE_TO, vRallyPoint ), worker.pUnit, false );
+		}
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::UpdateGarrisons( const std::vector<CVec2> &ownPoints )
+{
+	// A garrison whose point has been lost goes back to the army
+	std::vector<int> counts( ownPoints.size(), 0 );
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		SWorker &worker = workers[i];
+		if ( worker.eRole == WR_GARRISON )
+		{
+			const int nPoint = NBotObjectives::FindTarget( ownPoints, worker.vTarget );
+			if ( nPoint < 0 )
+			{
+				worker.eRole = WR_GATHERING;
+				worker.bHasTarget = false;
+				worker.bDugIn = false;
+			}
+			else
+			{
+				++counts[nPoint];
+			}
+		}
+	}
+
+	// Each point takes the nearest units that have just fought for it, infantry before vehicles
+	const int nWanted = NBotObjectives::GarrisonPerPoint( workers.size(), ownPoints.size() );
+	for ( int nPoint = 0; nPoint < ownPoints.size(); ++nPoint )
+	{
+		while ( counts[nPoint] < nWanted )
+		{
+			int nBest = -1;
+			float fBest = 0.0f;
+			for ( int i = 0; i < workers.size(); ++i )
+			{
+				const SWorker &worker = workers[i];
+				if ( worker.eRole != WR_WAVE && worker.eRole != WR_GATHERING )
+				{
+					continue;
+				}
+				const float fDistance = fabs( worker.pUnit->GetCenterPlain() - ownPoints[nPoint] );
+				if ( fDistance > BOT_GARRISON_RADIUS )
+				{
+					continue;
+				}
+				const float fScore = fDistance + ( worker.pUnit->IsFormation() ? 0.0f : BOT_GARRISON_RADIUS );
+				if ( nBest < 0 || fScore < fBest )
+				{
+					nBest = i;
+					fBest = fScore;
+				}
+			}
+			if ( nBest < 0 )
+			{
+				break;
+			}
+			SWorker &worker = workers[nBest];
+			worker.eRole = WR_GARRISON;
+			worker.nWave = -1;
+			worker.vTarget = ownPoints[nPoint];
+			worker.bHasTarget = false;
+			worker.bDugIn = false;
+			++counts[nPoint];
+		}
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::UpdateWaves( const std::vector<STarget> &targets )
+{
+	for ( int nWave = waves.size() - 1; nWave >= 0; --nWave )
+	{
+		SWave &wave = waves[nWave];
+		CVec2 vSum = VNULL2;
+		float fOwnStrength = 0.0f;
+		int nMembers = 0;
+		for ( int i = 0; i < workers.size(); ++i )
+		{
+			if ( workers[i].eRole == WR_WAVE && workers[i].nWave == wave.nID )
+			{
+				vSum += workers[i].pUnit->GetCenterPlain();
+				fOwnStrength += workers[i].pUnit->GetPriceMax();
+				++nMembers;
+			}
+		}
+		if ( nMembers == 0 )
+		{
+			waves.erase( waves.begin() + nWave );
+			continue;
+		}
+
+		const CVec2 vCenter = vSum / float( nMembers );
+		const bool bRetreat =
+				NBotObjectives::ShouldWaveRetreat( fOwnStrength, GetEnemyStrengthNear( vCenter, BOT_THREAT_RADIUS ) ) &&
+				bHasRallyPoint && fabs( vCenter - vRallyPoint ) > BOT_RALLY_RADIUS;
+
+		// Target taken or gone: on to the nearest next one, or back if there is none
+		int nNext = -1;
+		if ( !bRetreat )
+		{
+			float fBest = 0.0f;
+			for ( int i = 0; i < targets.size(); ++i )
+			{
+				if ( targets[i].vCenter == wave.vTarget )
+				{
+					nNext = i;
+					break;
+				}
+				const float fDistance = fabs2( targets[i].vCenter - vCenter );
+				if ( nNext < 0 || fDistance < fBest )
+				{
+					nNext = i;
+					fBest = fDistance;
+				}
+			}
+		}
+
+		if ( nNext < 0 )
+		{
+			for ( int i = 0; i < workers.size(); ++i )
+			{
+				if ( workers[i].eRole == WR_WAVE && workers[i].nWave == wave.nID )
+				{
+					workers[i].eRole = WR_GATHERING;
+					workers[i].nWave = -1;
+					workers[i].bHasTarget = false;
+				}
+			}
+			timeGatheringStarted = curTime;
+			waves.erase( waves.begin() + nWave );
+		}
+		else
+		{
+			wave.vTarget = targets[nNext].vCenter;
+		}
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::LaunchWaves( const std::vector<STarget> &targets )
+{
+	// Objectives nobody is on the way to, the ones about to be lost first
+	std::vector<STarget> freeTargets;
+	for ( int nUrgent = 1; nUrgent >= 0; --nUrgent )
+	{
+		for ( int i = 0; i < targets.size(); ++i )
+		{
+			bool bTaken = false;
+			for ( int j = 0; j < waves.size(); ++j )
+			{
+				bTaken = bTaken || waves[j].vTarget == targets[i].vCenter;
+			}
+			if ( !bTaken && targets[i].bUrgent == ( nUrgent == 1 ) )
+			{
+				freeTargets.push_back( targets[i] );
+			}
+		}
+	}
+
+	while ( !freeTargets.empty() && waves.size() < BOT_MAX_WAVES )
+	{
+		int nGathered = 0;
+		for ( int i = 0; i < workers.size(); ++i )
+		{
+			nGathered += workers[i].eRole == WR_GATHERING ? 1 : 0;
+		}
+
+		// The closest of the most pressing kind
+		int nTarget = 0;
+		const CVec2 vFrom = bHasRallyPoint ? vRallyPoint : freeTargets.front().vCenter;
+		for ( int i = 1; i < freeTargets.size(); ++i )
+		{
+			if ( freeTargets[i].bUrgent == freeTargets[0].bUrgent &&
+			     fabs2( freeTargets[i].vCenter - vFrom ) < fabs2( freeTargets[nTarget].vCenter - vFrom ) )
+			{
+				nTarget = i;
+			}
+		}
+
+		const STarget target = freeTargets[nTarget];
+		if ( !NBotObjectives::ShouldLaunchWave( nGathered, target.bContested, target.bUrgent, curTime - timeGatheringStarted ) )
+		{
+			break;
+		}
+
+		SWave &wave = waves.emplace_back();
+		wave.nID = nNextWaveID++;
+		wave.vTarget = target.vCenter;
+		int nLeft = NBotObjectives::WaveSize( nGathered, freeTargets.size() );
+		for ( int i = 0; i < workers.size() && nLeft > 0; ++i )
+		{
+			if ( workers[i].eRole == WR_GATHERING )
+			{
+				workers[i].eRole = WR_WAVE;
+				workers[i].nWave = wave.nID;
+				workers[i].bHasTarget = false;
+				--nLeft;
+			}
+		}
+		timeGatheringStarted = curTime;
+		freeTargets.erase( freeTargets.begin() + nTarget );
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::SendWorkers()
+{
+	const float fCaptureRadius = SConsts::RADIUS_TO_TAKE_STORAGE_OWNERSHIP * 0.8f;
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		SWorker &worker = workers[i];
+		CVec2 vTarget = worker.vTarget;
+		float fCloseEnough = fCaptureRadius;
+		switch ( worker.eRole )
+		{
+			case WR_RETREAT:
+				continue;
+			case WR_GATHERING:
+				if ( !bHasRallyPoint )
+				{
+					continue;
+				}
+				vTarget = vRallyPoint;
+				fCloseEnough = BOT_RALLY_RADIUS;
+				break;
+			case WR_WAVE:
+			{
+				bool bFound = false;
+				for ( int j = 0; j < waves.size(); ++j )
+				{
+					if ( waves[j].nID == worker.nWave )
+					{
+						vTarget = waves[j].vTarget;
+						bFound = true;
+					}
+				}
+				if ( !bFound )
+				{
+					worker.eRole = WR_GATHERING;
+					worker.nWave = -1;
+					worker.bHasTarget = false;
+					continue;
+				}
+				break;
+			}
+			case WR_GARRISON:
+				break;
+		}
+
+		const bool bNewTarget = !worker.bHasTarget || worker.vTarget != vTarget;
+		const bool bIdle = worker.pUnit->GetState() && worker.pUnit->GetState()->IsRestState();
+		const bool bFar = fabs( worker.pUnit->GetCenterPlain() - vTarget ) > fCloseEnough;
+		worker.vTarget = vTarget;
+		worker.bHasTarget = true;
+		if ( bNewTarget || ( bIdle && bFar ) )
+		{
+			worker.bDugIn = false;
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
+		}
+		else if ( worker.eRole == WR_GARRISON && bIdle && !worker.bDugIn )
+		{
+			// Arrived: dig in if this kind of unit can. Only once, so that it isn't kept busy digging.
+			worker.bDugIn = true;
+			if ( worker.pUnit->CanCommandBeExecutedByStats( ACTION_COMMAND_ENTRENCH_SELF ) )
+			{
+				theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_ENTRENCH_SELF ), worker.pUnit, false );
+			}
+		}
 	}
 }
 
 void CGeneralTaskCaptureKeyPoints::GiveOrders()
 {
-	std::vector<CVec2> targets;
+	std::vector<STarget> targets;
 	std::vector<CVec2> ownPoints;
 	CollectTargets( &targets, &ownPoints );
-	if ( targets.empty() )
-	{
-		targets = ownPoints; // Nothing to attack: stand on what we hold
-	}
-	if ( targets.empty() )
-	{
-		return;
-	}
+	UpdateRallyPoint( targets, ownPoints );
+	UpdateRetreats();
+	UpdateGarrisons( ownPoints );
+	UpdateWaves( targets );
 
-	std::vector<NBotObjectives::SWorker> plan( workers.size() );
+	// The wait for a wave counts from when the first unit starts gathering
+	bool bAnyGathering = false;
 	for ( int i = 0; i < workers.size(); ++i )
 	{
-		plan[i].vPosition = workers[i].pUnit->GetCenterPlain();
-		plan[i].nTarget = -1;
-		if ( workers[i].bHasTarget )
-		{
-			plan[i].nTarget = NBotObjectives::FindTarget( targets, workers[i].vTarget );
-		}
+		bAnyGathering = bAnyGathering || workers[i].eRole == WR_GATHERING;
 	}
-	NBotObjectives::AssignTargets( targets, &plan );
-
-	for ( int i = 0; i < workers.size(); ++i )
+	if ( !bAnyGathering || !bGatheringStarted )
 	{
-		SWorker &worker = workers[i];
-		const CVec2 vTarget = targets[plan[i].nTarget];
-		const bool bNewTarget = !worker.bHasTarget || worker.vTarget != vTarget;
-		const float fCaptureRadius = SConsts::RADIUS_TO_TAKE_STORAGE_OWNERSHIP * 0.8f;
-		const bool bIdle = worker.pUnit->GetState() && worker.pUnit->GetState()->IsRestState();
-		worker.vTarget = vTarget;
-		worker.bHasTarget = true;
-
-		if ( bNewTarget )
-		{
-			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
-		}
-		else if ( bIdle && fabs( worker.pUnit->GetCenterPlain() - vTarget ) > fCaptureRadius )
-		{
-			// Arrived without getting into capture range, or the swarm ended early.
-			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
-		}
+		timeGatheringStarted = curTime;
+		bGatheringStarted = bAnyGathering;
 	}
+
+	LaunchWaves( targets );
+	SendWorkers();
 }
 
 void CGeneralTaskCaptureKeyPoints::Segment()

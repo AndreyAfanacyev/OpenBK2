@@ -236,3 +236,110 @@ public:
 
 	void SetCellInUse( const int nResistanceCell, bool bInUse );
 };
+
+// ****
+// Net game bots. The single player general only fires guns that a mission placed at prepared
+// positions. On a multiplayer map guns arrive far from any fight, so a bot has to bring them
+// within range itself: by tractor, under their own power, or not at all if they can't move.
+// ****
+class CGeneralBotArtillery : public CAIObjectBase, public IEnemyEnumerator
+{
+	OBJECT_BASIC_METHODS( CGeneralBotArtillery );
+
+	enum EGunRole
+	{
+		GR_INDIRECT, // howitzers, mortars, rockets: far behind the front, firing at areas
+		GR_DIRECT,   // anti-tank guns and heavy machine guns: close behind the front, fire by themselves
+		GR_ANTIAIR,  // stands at a point of ours
+	};
+
+	enum EGunState
+	{
+		GS_READY,
+		GS_MOVING,
+		GS_AIMING,
+		GS_FIRING,
+	};
+
+	struct SGun
+	{
+		ZDATA
+		CPtr<CAIUnit> pGun;
+		CPtr<CAIUnit> pTractor;
+		EGunState eState = GS_READY;
+		NTimer::STime timeStateEnd = {};
+		NTimer::STime timeNextFire = {};
+		NTimer::STime timeNextMove = {};
+		CVec2 vFirePoint;
+		CVec2 vDestination;
+		bool bAtRealTarget = {};
+		int nFailedMoves = {};
+
+		ZEND int operator&( IBinSaver &f )
+		{
+			f.Add( 2, &pGun );
+			f.Add( 3, &pTractor );
+			f.Add( 4, &eState );
+			f.Add( 5, &timeStateEnd );
+			f.Add( 6, &timeNextFire );
+			f.Add( 7, &timeNextMove );
+			f.Add( 8, &vFirePoint );
+			f.Add( 9, &vDestination );
+			f.Add( 10, &bAtRealTarget );
+			f.Add( 11, &nFailedMoves );
+			return 0;
+		}
+	};
+
+	ZDATA
+	CPtr<CGeneral> pOwner;
+	std::vector<SGun> guns;
+	std::vector<CPtr<CAIUnit>> tractors;
+
+	ZEND int operator&( IBinSaver &f ) override
+	{
+		f.Add( 2, &pOwner );
+		f.Add( 3, &guns );
+		f.Add( 4, &tractors );
+		return 0;
+	}
+
+	std::vector<CVec2> resistanceCenters; // refilled every segment
+
+	static EGunRole GetRole( const CAIUnit *pGun );
+	static float GetRange( CAIUnit *pGun );
+	static float GetMinRange( CAIUnit *pGun );
+	static bool CanRelocateByItself( CAIUnit *pGun );
+
+	bool FindFocus( const SGun &gun, EGunRole eRole, CVec2 *pFocus ) const;
+	bool FindFirePoint( const SGun &gun, CVec2 *pPoint, bool *pbRealTarget ) const;
+	CAIUnit *FindTractor( const SGun &gun ) const;
+	void MoveGun( SGun *pGun, const CVec2 &vDestination );
+	void SegmentReady( SGun *pGun );
+	void SegmentMoving( SGun *pGun );
+	void SegmentAiming( SGun *pGun );
+	void SegmentFiring( SGun *pGun );
+
+public:
+	CGeneralBotArtillery() {}
+
+	CGeneralBotArtillery( CGeneral *_pOwner );
+
+	// Guns, and tractors that move them
+	static bool TakesUnit( CAIUnit *pUnit );
+	void Take( CAIUnit *pUnit );
+	void Segment();
+
+	int GetGunCount() const
+	{
+		return guns.size();
+	}
+
+	// IEnemyEnumerator
+	bool EnumEnemy( class CAIUnit *pEnemy ) override
+	{
+		return false;
+	}
+
+	bool EnumResistances( const struct SResistance &resistance ) override;
+};

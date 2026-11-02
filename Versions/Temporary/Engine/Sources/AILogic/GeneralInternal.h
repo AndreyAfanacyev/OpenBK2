@@ -15,6 +15,12 @@ class CCommonUnit;
 class CGeneralAirForce;
 class CGeneralArtillery;
 class CGeneralIntendant;
+class CGeneralBotArtillery;
+
+namespace NBotObjectives
+{
+struct SForces;
+}
 
 class CGeneral : public CCommander, public IEnemyContainer
 {
@@ -54,6 +60,7 @@ class CGeneral : public CCommander, public IEnemyContainer
 	CObj<CGeneralAirForce> pAirForce;
 	CObj<CGeneralArtillery> pGeneralArtillery;
 	CObj<CGeneralIntendant> pIntendant;
+	CObj<CGeneralBotArtillery> pBotArtillery; // net game bots position their guns themselves
 
 	RequestedTasks requestedTasks;
 
@@ -98,6 +105,7 @@ public:
 		f.Add( 24, &nPlayer );
 		f.Add( 25, &bEngineersNeeded );
 		f.Add( 26, &timeNextEngineersCall );
+		f.Add( 27, &pBotArtillery );
 		return 0;
 	}
 
@@ -109,6 +117,8 @@ public:
 
 	//Checks for reinforcement and calls if available
 	void CheckAvailableReinforcement();
+	void CountForces( NBotObjectives::SForces *pForces ) const;
+	void CallBotReinforcement( const NBotObjectives::SForces &forces );
 	void InitRearManager(); //do map-dependent calculations
 
 	enum EBalanceAction

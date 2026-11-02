@@ -5,12 +5,14 @@
 // alone, and sends them to the key point its side doesn't hold.
 
 #include "../AIClassesID.h"
+#include "../Artillery.h"
 #include "../B2AI.h"
 #include "../Building.h"
 #include "../Commands.h"
 #include "../DBAIConsts.h"
 #include "../Diplomacy.h"
 #include "../General.h"
+#include "../Guns.h"
 #include "../GroupLogic.h"
 #include "../KeyBuildingBonusSystem.h"
 #include "../LinkObject.h"
@@ -144,9 +146,9 @@ protected:
 
 	// nUniqueID is kept low: the shared command queues start with room for ten units,
 	// and only the real unit creation code grows them.
-	CAIUnit *MakeTank( uint8_t player, const int nUniqueID )
+	CAIUnit *MakeTank( uint8_t player, const int nUniqueID, const CVec2 &vAt = CVec2( 160, 160 ), float fHP = 100.0f )
 	{
-		return MakeVehicle( AI_TANK, stats, player, nUniqueID );
+		return MakeVehicle( AI_TANK, stats, player, nUniqueID, vAt, fHP );
 	}
 
 	CAIUnit *MakeEngineerTruck( uint8_t player, const int nUniqueID )
@@ -165,14 +167,18 @@ protected:
 		return MakeVehicle( AI_TRANSPORT_UNIT, truckStats, player, nUniqueID );
 	}
 
-	CAIUnit *MakeVehicle( const int nType, CDBPtr<NDb::SMechUnitRPGStats> unitStats, uint8_t player, const int nUniqueID )
+	CAIUnit *MakeVehicle( const int nType,
+	                      CDBPtr<NDb::SMechUnitRPGStats> unitStats,
+	                      uint8_t player,
+	                      const int nUniqueID,
+	                      const CVec2 &vAt = CVec2( 160, 160 ),
+	                      float hp = 100.0f )
 	{
 		CAIUnit *unit = MakeObject<CAIUnit>( nType );
-		CVec3 position( 160, 160, 0 );
+		CVec3 position( vAt.x, vAt.y, 0 );
 		SVector tile( int( position.x / SConsts::TILE_SIZE ), int( position.y / SConsts::TILE_SIZE ) );
 		SAIAngle direction( 0 );
 		bool idle = true;
-		float hp = 100;
 		CPtr<NDb::SUnitStatsModifier> modifierPointer = modifier.GetPtr();
 		std::vector<int> visibility{ 1, 1, 0 };
 		CPtr<CUnitGuns> unitGuns = MakeObject<CUnitGuns>( 0x1108D4C7 );
@@ -211,6 +217,136 @@ protected:
 		unit->nUniqueID = nUniqueID;
 		unit->Mem2UniqueIdObjs();
 		return unit;
+	}
+
+	// A real howitzer with a real gun, standing installed and ready
+	CAIUnit *MakeHowitzer( uint8_t player, const int nUniqueID, const CVec2 &vAt, const float fRange )
+	{
+		auto *weapon = MakeRecord<NDb::SWeaponRPGStats>( "WeaponRPGStats" );
+		weapon->fRangeMax = fRange;
+		weapon->nAmmoPerBurst = 1;
+		weapon->shells.resize( 1 );
+		weapon->shells[0].etrajectory = NDb::SWeaponRPGStats::SShell::TRAJECTORY_HOWITZER;
+		auto *gunStats = MakeRecord<NDb::SMechUnitRPGStats>( "MechUnitRPGStats" );
+		gunStats->etype = NDb::RPG_TYPE_ART_HOWITZER;
+		gunStats->fSight = 1;
+		gunStats->fMaxHP = 100;
+		gunStats->fPrice = 100;
+		gunStats->vAABBHalfSize = CVec2( 4, 8 );
+		auto *actions = MakeRecord<NDb::SUnitActions>( "UnitActions" );
+		actions->availCommands.SetData( ACTION_COMMAND_ART_BOMBARDMENT );
+		actions->availCommands.SetData( ACTION_COMMAND_ROTATE_TO );
+		actions->availCommands.SetData( ACTION_COMMAND_STOP );
+		gunStats->pActions = actions;
+		gunStats->platforms.resize( 1 );
+		gunStats->platforms[0].guns.resize( 1 );
+		gunStats->platforms[0].guns[0].pWeapon = weapon;
+		CDBPtr<NDb::SMechUnitRPGStats> unitStats = gunStats;
+
+		CAIUnit *unit = MakeObject<CAIUnit>( AI_ARTILLERY );
+		CPtr<CBasicGun> gun = MakeObject<CBasicGun>( 0x1108D4B5 );
+		CPtr<SCommonGunInfo> ammo = MakeObject<SCommonGunInfo>( 0x1108D4C9 );
+		ammo->nAmmo = 100;
+		CPtr<CUnitGuns> unitGuns = MakeObject<CUnitGuns>( 0x1108D4C7 );
+		CPtr<CAIUnit> owner = unit;
+		CDBPtr<NDb::SWeaponRPGStats> weaponPointer = weapon;
+		int gunType = IGunsFactory::VIS_CML_BALLIST_GUN;
+		SFields gunFields{ [&]( IBinSaver &saver ) { saver.Add( 2, &weaponPointer ); } };
+		SFields basicGun{ [&]( IBinSaver &saver )
+		                  {
+												saver.Add( 1, &gunFields );
+												saver.Add( 7, &gunType );
+												saver.Add( 13, &owner );
+												saver.Add( 15, &ammo );
+											} };
+		LoadFields( gun, [&]( IBinSaver &saver ) { saver.Add( 1, &basicGun ); } );
+		std::vector<CObj<CBasicGun>> gunArray{ gun.GetPtr() };
+		std::vector<CPtr<SCommonGunInfo>> commonGuns{ ammo };
+		std::vector<int> beginnings{ 0 };
+		int count = 1;
+		SFields gunCollection{ [&]( IBinSaver &saver )
+		                       {
+														 saver.Add( 2, &weapon->fRangeMax );
+														 saver.Add( 4, &commonGuns );
+														 saver.Add( 5, &gunArray );
+														 saver.Add( 6, &beginnings );
+														 saver.Add( 7, &count );
+													 } };
+		int nFirstArtilleryGun = 0;
+		LoadFields( unitGuns,
+		            [&]( IBinSaver &saver )
+		            {
+									saver.Add( 1, &gunCollection );
+									saver.Add( 2, &nFirstArtilleryGun );
+								} );
+
+		CVec3 position( vAt.x, vAt.y, 0 );
+		SVector tile( int( position.x / SConsts::TILE_SIZE ), int( position.y / SConsts::TILE_SIZE ) );
+		SAIAngle direction( 0 );
+		bool idle = true;
+		float hp = 100;
+		CPtr<NDb::SUnitStatsModifier> modifierPointer = modifier.GetPtr();
+		std::vector<int> visibility{ 1, 1, 0 };
+		CPtr<IUnitState> rest = MakeObject<IUnitState>( 0x1508D494 );
+		CPtr<CAIUnit> restOwner = unit;
+		LoadFields( rest, [&]( IBinSaver &saver ) { saver.Add( 2, &restOwner ); } );
+		SFields path{ [&]( IBinSaver &saver )
+		              {
+										saver.Add( 3, &direction );
+										saver.Add( 4, &direction );
+										saver.Add( 9, &position );
+										saver.Add( 10, &tile );
+										saver.Add( 16, &idle );
+									} };
+		SFields queue{ [&]( IBinSaver &saver ) { saver.Add( 2, &rest ); } };
+		SFields common{ [&]( IBinSaver &saver )
+		                {
+											saver.Add( 3, &queue );
+											saver.Add( 20, &path );
+										} };
+		SFields ai{ [&]( IBinSaver &saver )
+		            {
+									saver.Add( 1, &common );
+									saver.Add( 6, &player );
+									saver.Add( 15, &hp );
+									saver.Add( 51, &visibility );
+									saver.Add( 58, &modifierPointer );
+								} };
+		bool installed = true;
+		float operable = 1;
+		EActionNotify installAction = ACTION_NOTIFY_NONE;
+		LoadFields( unit,
+		            [&]( IBinSaver &saver )
+		            {
+									saver.Add( 1, &ai );
+									saver.Add( 2, &unitStats );
+									saver.Add( 4, &unitGuns );
+									saver.Add( 6, &installAction );
+									saver.Add( 7, &installAction );
+									saver.Add( 8, &installAction );
+									saver.Add( 9, &installed );
+									saver.Add( 17, &operable );
+								} );
+		unit->nUniqueID = nUniqueID;
+		unit->Mem2UniqueIdObjs();
+		return unit;
+	}
+
+	CAIUnit *MakeTractor( uint8_t player, const int nUniqueID, const CVec2 &vAt )
+	{
+		auto *tractorStats = MakeRecord<NDb::SMechUnitRPGStats>( "MechUnitRPGStats" );
+		tractorStats->etype = NDb::RPG_TYPE_TRN_TRACTOR;
+		tractorStats->fSight = 1;
+		tractorStats->fSpeed = 10;
+		tractorStats->fRotateSpeed = 1;
+		tractorStats->fMaxHP = 100;
+		tractorStats->fPrice = 100;
+		tractorStats->vAABBHalfSize = CVec2( 4, 8 );
+		auto *actions = MakeRecord<NDb::SUnitActions>( "UnitActions" );
+		actions->availCommands.SetData( ACTION_COMMAND_TAKE_ARTILLERY );
+		actions->availCommands.SetData( ACTION_COMMAND_DEPLOY_ARTILLERY );
+		tractorStats->pActions = actions;
+		return MakeVehicle( AI_TRANSPORT_UNIT, tractorStats, player, nUniqueID, vAt );
 	}
 
 	void PlaceKeyBuilding( int nOwner, float fHP = 100.0f )
@@ -283,6 +419,8 @@ protected:
 		unitStats->vAABBHalfSize = CVec2( 4, 8 );
 		auto *actions = MakeRecord<NDb::SUnitActions>( "UnitActions" );
 		actions->availCommands.SetData( ACTION_COMMAND_SWARM_TO );
+		actions->availCommands.SetData( ACTION_COMMAND_MOVE_TO );
+		actions->availCommands.SetData( ACTION_COMMAND_ENTRENCH_SELF );
 		unitStats->pActions = actions;
 		stats = unitStats;
 
@@ -320,10 +458,9 @@ protected:
 		theSupremeBeing.GiveNewUnitsToGenerals( startUnits );
 	}
 
-	// Two general ticks: the first hands out the units, the second gives orders.
-	void RunGenerals()
+	void RunGenerals( const int nTicks = 8 )
 	{
-		for ( int i = 0; i < 2; ++i )
+		for ( int i = 0; i < nTicks; ++i )
 		{
 			curTime += 20000;
 			theSupremeBeing.Segment();
@@ -396,6 +533,102 @@ TEST_P( NetBotGeneral, AnUndamagedKeyPointNeedsNoEngineers )
 	RunGenerals();
 
 	EXPECT_FALSE( IsOrderedToRepairKeyPoint( truck ) );
+}
+
+TEST_P( NetBotGeneral, ATractorTakesAGunOutOfRangeToTheFront )
+{
+	CAIUnit *gun = MakeHowitzer( PLAYER_BOT, 1, CVec2( 160, 160 ), 600.0f );
+	CAIUnit *tractor = MakeTractor( PLAYER_BOT, 2, CVec2( 200, 160 ) );
+	PlaceKeyBuilding( PLAYER_ENEMY );
+	StartGenerals( { gun, tractor } );
+
+	RunGenerals( 1 );
+
+	CAICommand *pCommand = tractor->GetNextCommand();
+	ASSERT_NE( pCommand, nullptr );
+	EXPECT_EQ( pCommand->ToUnitCmd().nCmdType, ACTION_COMMAND_TAKE_ARTILLERY );
+	EXPECT_EQ( pCommand->ToUnitCmd().nObjectID, 1 );
+}
+
+TEST_P( NetBotGeneral, AGunThatReachesAnEnemyPointFiresNearItWithoutWreckingIt )
+{
+	// In range but not so close that it would need to move
+	CAIUnit *gun = MakeHowitzer( PLAYER_BOT, 1, KEY_POINT - CVec2( 500.0f, 0.0f ), 600.0f );
+	PlaceKeyBuilding( PLAYER_ENEMY );
+	StartGenerals( { gun } );
+
+	RunGenerals( 2 ); // aims, then fires
+
+	CAICommand *pCommand = gun->GetNextCommand();
+	ASSERT_NE( pCommand, nullptr );
+	ASSERT_EQ( pCommand->ToUnitCmd().nCmdType, ACTION_COMMAND_ART_BOMBARDMENT );
+	const float fFromPoint = fabs( pCommand->ToUnitCmd().vPos - KEY_POINT );
+	EXPECT_GT( fFromPoint, float( SConsts::TILE_SIZE ) );
+	EXPECT_LT( fFromPoint, 600.0f );
+}
+
+TEST_P( NetBotGeneral, ALoneUnitWaitsForOthersBeforeAttackingADefendedPoint )
+{
+	CAIUnit *tank = MakeTank( PLAYER_BOT, 1 );
+	PlaceKeyBuilding( PLAYER_ENEMY );
+	StartGenerals( { tank } );
+
+	RunGenerals( 3 ); // a minute
+	EXPECT_FALSE( IsOrderedToKeyPoint( tank ) );
+
+	RunGenerals( 5 );
+	EXPECT_TRUE( IsOrderedToKeyPoint( tank ) ) << "but not forever";
+}
+
+TEST_P( NetBotGeneral, AFreePointIsTakenWithoutWaiting )
+{
+	CAIUnit *first = MakeTank( PLAYER_BOT, 1 );
+	CAIUnit *second = MakeTank( PLAYER_BOT, 2 );
+	PlaceKeyBuilding( N_PLAYERS );
+	StartGenerals( { first, second } );
+
+	RunGenerals( 1 );
+
+	EXPECT_TRUE( IsOrderedToKeyPoint( first ) );
+	EXPECT_TRUE( IsOrderedToKeyPoint( second ) );
+}
+
+TEST_P( NetBotGeneral, ABadlyDamagedUnitLeavesForTheRallyPoint )
+{
+	CAIUnit *damaged = MakeTank( PLAYER_BOT, 1, CVec2( 160, 160 ), 20.0f );
+	CAIUnit *healthy = MakeTank( PLAYER_BOT, 2 );
+	PlaceKeyBuilding( PLAYER_BOT ); // the rally point is this point of ours, far from the tanks
+	StartGenerals( { damaged, healthy } );
+
+	RunGenerals( 1 );
+
+	const CAICommand *pCommand = damaged->GetNextCommand();
+	ASSERT_NE( pCommand, nullptr );
+	EXPECT_EQ( const_cast<CAICommand *>( pCommand )->ToUnitCmd().nCmdType, ACTION_COMMAND_MOVE_TO );
+	EXPECT_LT( fabs( const_cast<CAICommand *>( pCommand )->ToUnitCmd().vPos - KEY_POINT ), 1.0f );
+}
+
+TEST_P( NetBotGeneral, UnitsAtAPointOfOursLeaveAGarrisonThatDigsIn )
+{
+	std::list<CCommonUnit *> tanks;
+	std::vector<CAIUnit *> list;
+	for ( int i = 1; i <= 6; ++i )
+	{
+		list.push_back( MakeTank( PLAYER_BOT, i, KEY_POINT + CVec2( float( i ), 0.0f ) ) );
+		tanks.push_back( list.back() );
+	}
+	PlaceKeyBuilding( PLAYER_BOT );
+	StartGenerals( tanks );
+
+	RunGenerals( 2 );
+
+	int nDugIn = 0;
+	for ( CAIUnit *tank : list )
+	{
+		const CAICommand *pCommand = tank->GetNextCommand();
+		nDugIn += pCommand && const_cast<CAICommand *>( pCommand )->ToUnitCmd().nCmdType == ACTION_COMMAND_ENTRENCH_SELF;
+	}
+	EXPECT_EQ( nDugIn, 1 ) << "six units can spare one";
 }
 
 TEST_P( NetBotGeneral, NoGeneralsAndNoOrdersInANetGameWithoutBots )

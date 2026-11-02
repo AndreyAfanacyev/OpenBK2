@@ -3,11 +3,15 @@
 #include "Diplomacy.h"
 #include "Formation.h"
 #include "GeneralAirForce.h"
+#include "GeneralArtillery.h"
+#include "GeneralBotObjectives.h"
 #include "GeneralConsts.h"
 #include "GeneralInternal.h"
 #include "PlayerReinforcement.h"
 #include "Reinforcement.h"
 #include "Soldier.h"
+#include "UnitsIterators.h"
+#include "UnitsIterators2.h"
 
 #include <fmt/format.h>
 
@@ -57,7 +61,13 @@ void CGeneral::CheckAvailableReinforcement()
 
 	// A bot that needs a key point repaired calls engineers before anything else. The cooldown
 	// gives the truck time to arrive, so that the calls aren't all spent on the same repair.
-	if ( bEngineersNeeded && curTime >= timeNextEngineersCall &&
+	const bool bNetGame = theDipl.IsNetGame();
+	NBotObjectives::SForces forces;
+	if ( bNetGame )
+	{
+		CountForces( &forces );
+	}
+	if ( bEngineersNeeded && curTime >= timeNextEngineersCall && NBotObjectives::MayCallEngineers( forces ) &&
 	     theReinfArray[nPlayer].HasReinforcement( NDb::RT_ENGINEERING ) )
 	{
 		theReinfArray[nPlayer].CallReinforcement( NDb::RT_ENGINEERING, theReinfArray[nPlayer].GetRandomPoint(), -1 );
@@ -77,6 +87,12 @@ void CGeneral::CheckAvailableReinforcement()
 	{
 		pAirForce->PassTurn();
 		//CONSOLE_BUFFER_LOG( CONSOLE_STREAM_DEBUG_WINDOW, StrFmt( "Passing turn to airforce" ) );
+		return;
+	}
+
+	if ( bNetGame )
+	{
+		CallBotReinforcement( forces );
 		return;
 	}
 
@@ -147,6 +163,149 @@ void CGeneral::CheckAvailableReinforcement()
 					NDb::EReinforcementType( nAvailReinfs[i] ), theReinfArray[nPlayer].GetRandomPoint(), -1 );
 		}
 	}
+}
+
+static int GetBotCategory( const int /*NDb::EReinforcementType*/ eType )
+{
+	switch ( eType )
+	{
+		case NDb::RT_MAIN_INFANTRY:
+		case NDb::RT_ASSAULT_INFANTRY:
+		case NDb::RT_ELITE_INFANTRY:
+		case NDb::RT_PARATROOPS:
+			return NBotObjectives::FC_INFANTRY;
+		case NDb::RT_ASSAULT_GUNS:
+		case NDb::RT_LIGHT_TANKS:
+		case NDb::RT_TANKS:
+		case NDb::RT_HEAVY_TANKS:
+			return NBotObjectives::FC_ARMOR;
+		case NDb::RT_ARTILLERY_ANTITANK:
+		case NDb::RT_TANK_DESTROYERS:
+			return NBotObjectives::FC_ANTITANK;
+		case NDb::RT_ARTILLERY:
+		case NDb::RT_ARTILLERY_ROCKET:
+			return NBotObjectives::FC_ARTILLERY;
+		case NDb::RT_LIGHT_AAA:
+		case NDb::RT_HEAVY_AAA:
+			return NBotObjectives::FC_ANTIAIR;
+		default:
+			return NBotObjectives::FC_NOT_COMBAT;
+	}
+}
+
+void CGeneral::CountForces( NBotObjectives::SForces *pForces ) const
+{
+	for ( CGlobalIter iter( 0, ANY_PARTY ); !iter.IsFinished(); iter.Iterate() )
+	{
+		CAIUnit *pUnit = *iter;
+		if ( !pUnit->IsAlive() || pUnit->GetPlayer() != nPlayer )
+		{
+			continue;
+		}
+		// By what the unit is rather than how it was called: a mod's mixed reinforcement has no category.
+		const SUnitBaseRPGStats *pStats = pUnit->GetStats();
+		if ( pStats->IsInfantry() )
+		{
+			pForces->own[NBotObjectives::FC_INFANTRY] += 0.2f; // about a squad's worth of soldiers is one unit
+		}
+		else if ( pStats->etype == RPG_TYPE_ART_AAGUN || pStats->etype == RPG_TYPE_SPG_AAGUN )
+		{
+			pForces->own[NBotObjectives::FC_ANTIAIR] += 1.0f;
+		}
+		else if ( pStats->etype == RPG_TYPE_ART_GUN || pStats->etype == RPG_TYPE_SPG_ANTITANK )
+		{
+			pForces->own[NBotObjectives::FC_ANTITANK] += 1.0f;
+		}
+		else if ( pStats->IsArtillery() )
+		{
+			pForces->own[NBotObjectives::FC_ARTILLERY] += 1.0f;
+		}
+		else if ( pStats->IsArmor() || pStats->IsSPG() )
+		{
+			pForces->own[NBotObjectives::FC_ARMOR] += 1.0f;
+		}
+	}
+
+	// Only enemies the side has seen recently: this map forgets the others (EraseLastSeen)
+	for ( CEnemyVisibility::const_iterator it = enemys.begin(); it != enemys.end(); ++it )
+	{
+		const CAIUnit *pEnemy = it->second.first;
+		if ( !IsValidObj( pEnemy ) )
+		{
+			continue;
+		}
+		const SUnitBaseRPGStats *pStats = pEnemy->GetStats();
+		if ( pStats->IsAviation() )
+		{
+			pForces->enemyAir += 1.0f;
+		}
+		else if ( pStats->IsInfantry() )
+		{
+			pForces->enemyInfantry += 0.2f;
+		}
+		else if ( pStats->IsArmor() || pStats->IsSPG() )
+		{
+			pForces->enemyArmor += 1.0f;
+		}
+	}
+}
+
+void CGeneral::CallBotReinforcement( const NBotObjectives::SForces &forces )
+{
+	bool available[NBotObjectives::FC_COUNT] = {};
+	for ( int i = 0; i < NDb::_RT_NONE; ++i )
+	{
+		const int nCategory = GetBotCategory( i );
+		if ( nCategory != NBotObjectives::FC_NOT_COMBAT && theReinfArray[nPlayer].HasReinforcement( NDb::EReinforcementType( i ) ) )
+		{
+			available[nCategory] = true;
+		}
+	}
+
+	// Not over the limit of units, counting what this call would bring
+	int nWorkers = pBotArtillery ? pBotArtillery->GetGunCount() : 0;
+	for ( Tasks::iterator it = tasks.begin(); it != tasks.end(); ++it )
+	{
+		nWorkers += ( *it )->GetWorkerCount();
+	}
+	if ( nWorkers >= nMaxAllowedMobileTanks )
+	{
+		return;
+	}
+
+	const int nCategory = NBotObjectives::ChooseCategory( forces, available );
+	std::vector<int> types;
+	for ( int i = 0; i < NDb::_RT_NONE; ++i )
+	{
+		const bool bAvailable = theReinfArray[nPlayer].HasReinforcement( NDb::EReinforcementType( i ) );
+		if ( bAvailable && GetBotCategory( i ) == nCategory && nCategory != NBotObjectives::FC_NOT_COMBAT )
+		{
+			types.push_back( i );
+		}
+	}
+
+	// Mods add reinforcement types of their own, which the categories above don't know. A side
+	// with nothing else still has to call something, as long as it isn't only engineers or aircraft.
+	if ( types.empty() )
+	{
+		for ( int i = 0; i < NDb::_RT_NONE; ++i )
+		{
+			if ( theReinfArray[nPlayer].HasReinforcement( NDb::EReinforcementType( i ) ) && !IsAviationReinfType( i ) &&
+			     i != NDb::RT_ENGINEERING )
+			{
+				types.push_back( i );
+			}
+		}
+	}
+	if ( types.empty() )
+	{
+		return;
+	}
+
+	const int nChoice = NRandom::Random( int( types.size() ) );
+	RecordRandomCall();
+	theReinfArray[nPlayer].CallReinforcement(
+			NDb::EReinforcementType( types[nChoice] ), theReinfArray[nPlayer].GetRandomPoint(), -1 );
 }
 
 void CGeneral::BalanceUpdate( EBalanceAction eAction, CCommonUnit *_pUnit )
