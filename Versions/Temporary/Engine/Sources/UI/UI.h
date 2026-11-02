@@ -709,6 +709,8 @@ struct IComboBox : virtual public IWindow
 
 	virtual void SetViewer( IDataViewer *pViewer ) = 0;
 	virtual void SetLine( CObjectBase *pData ) = 0;
+	// For a list that needs more rows than its screen record allows
+	virtual void SetMaxVisibleRows( int nRows ) = 0;
 };
 
 // возвращает указатель только при наличии дочернего окна соответствующего типа,

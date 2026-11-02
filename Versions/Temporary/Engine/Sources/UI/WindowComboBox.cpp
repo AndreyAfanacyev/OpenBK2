@@ -91,6 +91,12 @@ void CWindowComboBox::Reposition( const CTRect<float> &parentRect )
 	}
 }
 
+void CWindowComboBox::SetMaxVisibleRows( const int nRows )
+{
+	nMaxVisibleRows = nRows;
+	ResizeList();
+}
+
 void CWindowComboBox::ResizeList()
 {
 	if ( pList && nMaxVisibleRows > 0 )

@@ -758,6 +758,8 @@ bool CInterfaceMPGameRoom::OnGameRoomInitMessage( const SMPUIGameRoomInitMessage
 				slot.pPlayerName->ShowWindow( false );
 				slot.pPlayerCombo->ShowWindow( true );
 				slot.pPlayerCombo->SetViewer( new CTextDataViewer() );
+				// The screen's record sizes this list for two rows, open and close, and the bots would be cut off.
+				slot.pPlayerCombo->SetMaxVisibleRows( 4 );
 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_OPEN" ) ) );
 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_CLOSE" ) ) );
 				// Written out rather than taken from the UI text tables, which belong to the installed

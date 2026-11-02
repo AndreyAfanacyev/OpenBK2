@@ -89,6 +89,7 @@ public:
 
 	//{ IComboBox
 	void AddItem( CObjectBase *pData ) override;
+	void SetMaxVisibleRows( int nRows ) override;
 	void RemoveItem( CObjectBase *pData ) override;
 	void RemoveAllItems() override;
 
