@@ -48,6 +48,7 @@ extern CGroupLogic theGroupLogic;
 namespace
 {
 const int KEY_POINT_LINK = 7;
+const int KEY_POINT_UNIQUE_ID = 9;
 const CVec2 KEY_POINT( 1600, 1600 );
 
 enum
@@ -145,7 +146,28 @@ protected:
 	// and only the real unit creation code grows them.
 	CAIUnit *MakeTank( uint8_t player, const int nUniqueID )
 	{
-		CAIUnit *unit = MakeObject<CAIUnit>( AI_TANK );
+		return MakeVehicle( AI_TANK, stats, player, nUniqueID );
+	}
+
+	CAIUnit *MakeEngineerTruck( uint8_t player, const int nUniqueID )
+	{
+		auto *truckStats = MakeRecord<NDb::SMechUnitRPGStats>( "MechUnitRPGStats" );
+		truckStats->etype = NDb::RPG_TYPE_TRN_SUPPORT;
+		truckStats->fSight = 1;
+		truckStats->fSpeed = 10;
+		truckStats->fRotateSpeed = 1;
+		truckStats->fMaxHP = 100;
+		truckStats->fPrice = 100;
+		truckStats->vAABBHalfSize = CVec2( 4, 8 );
+		auto *actions = MakeRecord<NDb::SUnitActions>( "UnitActions" );
+		actions->availCommands.SetData( ACTION_COMMAND_REPEAR_OBJECT );
+		truckStats->pActions = actions;
+		return MakeVehicle( AI_TRANSPORT_UNIT, truckStats, player, nUniqueID );
+	}
+
+	CAIUnit *MakeVehicle( const int nType, CDBPtr<NDb::SMechUnitRPGStats> unitStats, uint8_t player, const int nUniqueID )
+	{
+		CAIUnit *unit = MakeObject<CAIUnit>( nType );
 		CVec3 position( 160, 160, 0 );
 		SVector tile( int( position.x / SConsts::TILE_SIZE ), int( position.y / SConsts::TILE_SIZE ) );
 		SAIAngle direction( 0 );
@@ -182,7 +204,7 @@ protected:
 		SFields mechanical{ [&]( IBinSaver &saver )
 		                    {
 													saver.Add( 1, &ai );
-													saver.Add( 2, &stats );
+													saver.Add( 2, &unitStats );
 													saver.Add( 3, &unitGuns );
 												} };
 		LoadFields( unit, [&]( IBinSaver &saver ) { saver.Add( 1, &mechanical ); } );
@@ -191,16 +213,26 @@ protected:
 		return unit;
 	}
 
-	void PlaceKeyBuilding( int nOwner )
+	void PlaceKeyBuilding( int nOwner, float fHP = 100.0f )
 	{
 		CBuildingSimple *building = MakeObject<CBuildingSimple>( 0x1108D450 );
 		CVec3 center( KEY_POINT.x, KEY_POINT.y, 0 );
-		SFields passability{ [&]( IBinSaver &saver ) { saver.Add( 2, &center ); } };
+		auto *buildingRecord = MakeRecord<NDb::SBuildingRPGStats>( "BuildingRPGStats" );
+		ASSERT_NE( buildingRecord, nullptr );
+		buildingRecord->fMaxHP = 100.0f;
+		CDBPtr<NDb::SBuildingRPGStats> buildingStats = buildingRecord;
+		SFields existing{ [&]( IBinSaver &saver ) { saver.Add( 6, &fHP ); } };
+		SFields passability{ [&]( IBinSaver &saver )
+		                     {
+													 saver.Add( 1, &existing );
+													 saver.Add( 2, &center );
+												 } };
 		int nLinkID = KEY_POINT_LINK;
 		SFields base{ [&]( IBinSaver &saver )
 		              {
 										saver.Add( 1, &passability );
 										saver.Add( 28, &nLinkID );
+										saver.Add( 29, &buildingStats );
 									} };
 		LoadFields( building,
 		            [&]( IBinSaver &saver )
@@ -209,6 +241,7 @@ protected:
 									saver.Add( 2, &nOwner );
 								} );
 		building->SetLink( KEY_POINT_LINK );
+		building->nUniqueID = KEY_POINT_UNIQUE_ID;
 
 		NDb::SPlayerBonusData bonus;
 		bonus.nLinkID = KEY_POINT_LINK;
@@ -297,6 +330,13 @@ protected:
 		}
 	}
 
+	static bool IsOrderedToRepairKeyPoint( CCommonUnit *pUnit )
+	{
+		CAICommand *pCommand = pUnit->GetCurCmd() ? pUnit->GetCurCmd() : pUnit->GetNextCommand();
+		return pCommand && pCommand->ToUnitCmd().nCmdType == ACTION_COMMAND_REPEAR_OBJECT &&
+		       pCommand->ToUnitCmd().nObjectID == KEY_POINT_UNIQUE_ID;
+	}
+
 	static bool IsOrderedToKeyPoint( CCommonUnit *pUnit )
 	{
 		const CAICommand *pCommand = pUnit->GetCurCmd() ? pUnit->GetCurCmd() : pUnit->GetNextCommand();
@@ -331,6 +371,31 @@ TEST_P( NetBotGeneral, BotSendsItsOwnUnitsToTheEnemyKeyPointAndLeavesItsAllysAlo
 	EXPECT_TRUE( IsOrderedToKeyPoint( secondBotTank ) ) << "bots on one side must not take each other's units";
 	EXPECT_FALSE( IsOrderedToKeyPoint( allyTank ) );
 	EXPECT_FALSE( IsOrderedToKeyPoint( enemyTank ) );
+}
+
+// A neutral key point under 90% health can't be captured until engineers repair it.
+TEST_P( NetBotGeneral, EngineersRepairADamagedNeutralKeyPoint )
+{
+	CAIUnit *truck = MakeEngineerTruck( PLAYER_BOT, 6 );
+	CAIUnit *allyTruck = MakeEngineerTruck( PLAYER_ALLY, 7 );
+	PlaceKeyBuilding( N_PLAYERS, 50.0f ); // N_PLAYERS is the neutral player
+
+	StartGenerals( { truck, allyTruck } );
+	RunGenerals();
+
+	EXPECT_TRUE( IsOrderedToRepairKeyPoint( truck ) );
+	EXPECT_FALSE( IsOrderedToRepairKeyPoint( allyTruck ) );
+}
+
+TEST_P( NetBotGeneral, AnUndamagedKeyPointNeedsNoEngineers )
+{
+	CAIUnit *truck = MakeEngineerTruck( PLAYER_BOT, 8 );
+	PlaceKeyBuilding( N_PLAYERS, 100.0f );
+
+	StartGenerals( { truck } );
+	RunGenerals();
+
+	EXPECT_FALSE( IsOrderedToRepairKeyPoint( truck ) );
 }
 
 TEST_P( NetBotGeneral, NoGeneralsAndNoOrdersInANetGameWithoutBots )

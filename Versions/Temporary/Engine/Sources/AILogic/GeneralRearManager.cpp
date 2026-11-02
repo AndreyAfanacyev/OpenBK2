@@ -3,6 +3,7 @@
 #include "Diplomacy.h"
 #include "Formation.h"
 #include "GeneralAirForce.h"
+#include "GeneralConsts.h"
 #include "GeneralInternal.h"
 #include "PlayerReinforcement.h"
 #include "Reinforcement.h"
@@ -43,14 +44,24 @@ void CGeneral::CheckAvailableReinforcement()
 	bool bReinfFound = false;
 
 	// there is no ground reinforcements
-	if ( !theReinfArray[nParty].HasGroundReinforcements() )
+	if ( !theReinfArray[nPlayer].HasGroundReinforcements() )
 	{
 		pAirForce->PassTurn();
 		return;
 	}
 
-	if ( !theReinfArray[nParty].CanCallNow() )
+	if ( !theReinfArray[nPlayer].CanCallNow() )
 	{
+		return;
+	}
+
+	// A bot that needs a key point repaired calls engineers before anything else. The cooldown
+	// gives the truck time to arrive, so that the calls aren't all spent on the same repair.
+	if ( bEngineersNeeded && curTime >= timeNextEngineersCall &&
+	     theReinfArray[nPlayer].HasReinforcement( NDb::RT_ENGINEERING ) )
+	{
+		theReinfArray[nPlayer].CallReinforcement( NDb::RT_ENGINEERING, theReinfArray[nPlayer].GetRandomPoint(), -1 );
+		timeNextEngineersCall = curTime + SGeneralConsts::BOT_ENGINEERS_CALL_COOLDOWN;
 		return;
 	}
 
@@ -88,7 +99,7 @@ void CGeneral::CheckAvailableReinforcement()
 	int nARQuantity = 0;
 	for ( int i = 0; i < NDb::_RT_NONE; ++i )
 	{
-		if ( !theReinfArray[nParty].HasReinforcement( NDb::EReinforcementType( i ) ) || IsAviationReinfType( i ) )
+		if ( !theReinfArray[nPlayer].HasReinforcement( NDb::EReinforcementType( i ) ) || IsAviationReinfType( i ) )
 		{
 			continue;
 		}
@@ -116,14 +127,14 @@ void CGeneral::CheckAvailableReinforcement()
 	}
 	if ( bReinfFound ) // if there was a reinforcement available, call it
 	{
-		//theReinfArray[nParty].CallReinforcement( NDb::EReinforcementType( nReinfTypeToCall ),	theReinfArray[nParty].GetRandomPoint(), -1 );
+		//theReinfArray[nPlayer].CallReinforcement( NDb::EReinforcementType( nReinfTypeToCall ),	theReinfArray[nPlayer].GetRandomPoint(), -1 );
 		//CONSOLE_BUFFER_LOG( CONSOLE_STREAM_DEBUG_WINDOW, StrFmt( "Calling reinforcement %d", nReinfTypeToCall ) );
 		float fRandValue = NRandom::Random( 0.0f, fSum );
 		RecordRandomCall();
 		const int i = NReinforcement::SelectByCumulativeWeight( fReinfEff, nARQuantity, fRandValue );
 		// check if this reinforcement will increase mobile tanks nuber over the maximum allowed number
 		// don't call if it will
-		int nWorkers = theReinfArray[nParty].GetNEntries( NDb::EReinforcementType( nAvailReinfs[i] ) );
+		int nWorkers = theReinfArray[nPlayer].GetNEntries( NDb::EReinforcementType( nAvailReinfs[i] ) );
 		for ( Tasks::iterator it = tasks.begin(); it != tasks.end(); ++it )
 		{
 			nWorkers += ( *it )->GetWorkerCount();
@@ -132,8 +143,8 @@ void CGeneral::CheckAvailableReinforcement()
 
 		if ( nWorkers <= nMaxAllowedMobileTanks )
 		{
-			theReinfArray[nParty].CallReinforcement(
-					NDb::EReinforcementType( nAvailReinfs[i] ), theReinfArray[nParty].GetRandomPoint(), -1 );
+			theReinfArray[nPlayer].CallReinforcement(
+					NDb::EReinforcementType( nAvailReinfs[i] ), theReinfArray[nPlayer].GetRandomPoint(), -1 );
 		}
 	}
 }

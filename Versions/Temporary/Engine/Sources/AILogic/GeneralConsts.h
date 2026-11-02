@@ -9,6 +9,8 @@ struct SGeneralConsts
 
 	// A bot stops calling ground reinforcements at this many units under its command
 	static const int BOT_MAX_UNITS = 60;
+	// How long after calling engineers a bot waits before it may call more (msec)
+	static const int BOT_ENGINEERS_CALL_COOLDOWN = 90000;
 
 	static int SCOUT_FREE_POINT;
 	static int SCOUT_POINTS;

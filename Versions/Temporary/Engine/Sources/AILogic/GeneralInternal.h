@@ -65,6 +65,8 @@ class CGeneral : public CCommander, public IEnemyContainer
 	bool bSendReserves = {}; // send tanks to swarm
 	int nMaxAllowedMobileTanks = {};
 	int nPlayer = -1; // equal to nParty in single player; a net game side can hold several bots
+	bool bEngineersNeeded = {};           // a bot has a key point to repair and no truck to send
+	NTimer::STime timeNextEngineersCall = {};
 
 public:
 	ZEND int operator&( IBinSaver &f ) override
@@ -94,6 +96,8 @@ public:
 		f.Add( 22, &bSendReserves );
 		f.Add( 23, &nMaxAllowedMobileTanks );
 		f.Add( 24, &nPlayer );
+		f.Add( 25, &bEngineersNeeded );
+		f.Add( 26, &timeNextEngineersCall );
 		return 0;
 	}
 
@@ -221,5 +225,10 @@ public:
 	int GetPlayer() const
 	{
 		return nPlayer;
+	}
+
+	void SetEngineersNeeded( const bool bNeeded )
+	{
+		bEngineersNeeded = bNeeded;
 	}
 };

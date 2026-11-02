@@ -63,7 +63,15 @@ void CGeneral::EnumWorkers( const enum EForceType eType, IWorkerEnumerator *pEnu
 
 			break;
 		case FT_TRUCK_REPAIR_BUILDING:
-			EnumWorkersInternal( eType, pEnumerator, &transportsFree );
+			// A bot's engineer trucks wait with the supply trucks at the intendant.
+			if ( theDipl.IsNetGame() )
+			{
+				pIntendant->EnumWorkers( eType, pEnumerator );
+			}
+			else
+			{
+				EnumWorkersInternal( eType, pEnumerator, &transportsFree );
+			}
 			break;
 
 		default:

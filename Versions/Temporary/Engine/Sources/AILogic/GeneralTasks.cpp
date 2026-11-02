@@ -6,6 +6,7 @@
 #include "Formation.h"
 #include "KeyBuildingBonusSystem.h"
 #include "LinkObject.h"
+#include "PlayerReinforcement.h"
 #include "GeneralConsts.h"
 #include "GeneralBotObjectives.h"
 #include "GeneralHelper.h"
@@ -31,6 +32,7 @@ extern CDiplomacy theDipl;
 extern CGroupLogic theGroupLogic;
 extern CUnitCreation theUnitCreation;
 extern CKeyBuildingBonusSystem theBonusSystem;
+extern CPlayerReinforcementArray theReinfArray;
 const float GetWeightOfUnit( const SUnitBaseRPGStats *pStats );
 
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D489, CGeneralSwarmWaitForReady );
@@ -1016,26 +1018,159 @@ const int BOT_ORDERS_PERIOD = 6000;
 const int BOT_ORDERS_PERIOD_RANDOM = 2000;
 } // namespace
 
+// A neutral key point under this share of its health can't be captured (see CBuildingSimple::Segment)
+const float BOT_CAPTURABLE_HEALTH = 0.9f;
+const int BOT_MAX_REPAIR_TRUCKS = 3;
+const int BOT_MAX_REPAIR_ORDERS = 5;
+const int BOT_UNREACHABLE_POINT_RETRY = 120000;
+
+static CBuilding *GetKeyBuilding( const int nLink )
+{
+	CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( nLink ) );
+	return pBuilding && pBuilding->IsAlive() ? pBuilding : 0;
+}
+
+static bool IsBlockedByDamage( const CBuilding *pBuilding )
+{
+	return theDipl.GetNParty( pBuilding->GetPlayer() ) == theDipl.GetNeutralParty() &&
+	       pBuilding->GetHitPoints() < pBuilding->GetStats()->fMaxHP * BOT_CAPTURABLE_HEALTH;
+}
+
 void CGeneralTaskCaptureKeyPoints::AskForWorker( ICommander *pManager, const float fMaxSeverity, const bool bInit )
 {
 	pManager->EnumWorkers( FT_SWARMING_TANKS, this );
 	pManager->EnumWorkers( FT_FREE_INFANTRY, this );
+	if ( !pointsToRepair.empty() && repairs.size() < BOT_MAX_REPAIR_TRUCKS )
+	{
+		pManager->EnumWorkers( FT_TRUCK_REPAIR_BUILDING, this );
+	}
+}
+
+bool CGeneralTaskCaptureKeyPoints::EvaluateWorker( CCommonUnit *pUnit, const enum EForceType eType ) const
+{
+	return eType != FT_TRUCK_REPAIR_BUILDING || pUnit->CanCommandBeExecutedByStats( ACTION_COMMAND_REPEAR_OBJECT );
 }
 
 float CGeneralTaskCaptureKeyPoints::EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const
 {
+	if ( eType == FT_TRUCK_REPAIR_BUILDING && !pointsToRepair.empty() )
+	{
+		const CBuilding *pBuilding = GetKeyBuilding( pointsToRepair.front() );
+		if ( pBuilding )
+		{
+			const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+			return 1.0f / ( fabs2( vCenter - pUnit->GetCenterPlain() ) + 1.0f );
+		}
+	}
 	return float( pUnit->GetUniqueId() );
 }
 
 bool CGeneralTaskCaptureKeyPoints::EnumWorker( CCommonUnit *pUnit, const enum EForceType eType )
 {
+	if ( eType == FT_TRUCK_REPAIR_BUILDING )
+	{
+		// Always comes with a point waiting: AskForWorker checked. A point can have died since, then the truck goes back.
+		CBuilding *pBuilding = pointsToRepair.empty() ? 0 : GetKeyBuilding( pointsToRepair.front() );
+		if ( !pBuilding )
+		{
+			pOwner->Give( pUnit );
+			return false;
+		}
+		SRepair &repair = repairs.emplace_back();
+		repair.pTruck = pUnit;
+		repair.nLink = pointsToRepair.front();
+		repair.nOrders = 1;
+		pointsToRepair.erase( pointsToRepair.begin() );
+		theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_REPEAR_OBJECT, pBuilding->GetUniqueId() ), pUnit, false );
+		// A waiting truck went: no need to call another for this point in the same general update.
+		pOwner->SetEngineersNeeded( !pointsToRepair.empty() && repairs.size() < BOT_MAX_REPAIR_TRUCKS );
+		return false;
+	}
+
 	SWorker &worker = workers.emplace_back();
 	worker.pUnit = pUnit;
 	return true;
 }
 
+void CGeneralTaskCaptureKeyPoints::UpdateRepairs()
+{
+	// Trucks that are done, dead, or can't get there
+	for ( int i = repairs.size() - 1; i >= 0; --i )
+	{
+		SRepair &repair = repairs[i];
+		if ( !IsValidObj( repair.pTruck ) )
+		{
+			repairs.erase( repairs.begin() + i );
+			continue;
+		}
+
+		CBuilding *pBuilding = GetKeyBuilding( repair.nLink );
+		const bool bIdle = repair.pTruck->GetState() && repair.pTruck->GetState()->IsRestState();
+		const bool bWorkLeft = pBuilding && IsBlockedByDamage( pBuilding );
+		if ( !pBuilding || ( !bWorkLeft && bIdle ) )
+		{
+			pOwner->Give( repair.pTruck );
+			repairs.erase( repairs.begin() + i );
+		}
+		else if ( bIdle && bWorkLeft )
+		{
+			if ( repair.nOrders >= BOT_MAX_REPAIR_ORDERS )
+			{
+				unreachablePoints[repair.nLink] = curTime + BOT_UNREACHABLE_POINT_RETRY;
+				pOwner->Give( repair.pTruck );
+				repairs.erase( repairs.begin() + i );
+			}
+			else
+			{
+				++repair.nOrders;
+				theGroupLogic.UnitCommand(
+						SAIUnitCmd( ACTION_COMMAND_REPEAR_OBJECT, pBuilding->GetUniqueId() ), repair.pTruck, false );
+			}
+		}
+	}
+
+	// Damaged points nobody is on the way to
+	pointsToRepair.clear();
+	std::vector<int> links;
+	theBonusSystem.GetKeyBuildingLinks( &links );
+	for ( int i = 0; i < links.size(); ++i )
+	{
+		const CBuilding *pBuilding = GetKeyBuilding( links[i] );
+		if ( !pBuilding || !IsBlockedByDamage( pBuilding ) )
+		{
+			continue;
+		}
+		const det_map<int, NTimer::STime>::const_iterator unreachable = unreachablePoints.find( links[i] );
+		if ( unreachable != unreachablePoints.end() && curTime < unreachable->second )
+		{
+			continue;
+		}
+		bool bTruckOnTheWay = false;
+		for ( int j = 0; j < repairs.size(); ++j )
+		{
+			bTruckOnTheWay = bTruckOnTheWay || repairs[j].nLink == links[i];
+		}
+		if ( !bTruckOnTheWay )
+		{
+			pointsToRepair.push_back( links[i] );
+		}
+	}
+
+	// AskForWorker runs after this and takes a waiting truck if there is one. If one was
+	// waiting already this flag is cleared on the next pass, before the cooldown ends.
+	pOwner->SetEngineersNeeded( !pointsToRepair.empty() && repairs.size() < BOT_MAX_REPAIR_TRUCKS );
+}
+
 void CGeneralTaskCaptureKeyPoints::CancelTask( ICommander *pManager )
 {
+	for ( int i = 0; i < repairs.size(); ++i )
+	{
+		if ( IsValidObj( repairs[i].pTruck ) )
+		{
+			pManager->Give( repairs[i].pTruck );
+		}
+	}
+	repairs.clear();
 	for ( int i = 0; i < workers.size(); ++i )
 	{
 		if ( IsValidObj( workers[i].pUnit ) )
@@ -1058,12 +1193,14 @@ bool CGeneralTaskCaptureKeyPoints::EnumResistances( const SResistance &resistanc
 void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints )
 {
 	const int nParty = pOwner->GetParty();
+	// Without engineers on the way or on call, standing at a wrecked point would achieve nothing.
+	const bool bCanRepair = !repairs.empty() || theReinfArray[pOwner->GetPlayer()].HasReinforcement( NDb::RT_ENGINEERING );
 	std::vector<int> links;
 	theBonusSystem.GetKeyBuildingLinks( &links );
 	for ( int i = 0; i < links.size(); ++i )
 	{
-		CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( links[i] ) );
-		if ( !pBuilding || !pBuilding->IsAlive() )
+		CBuilding *pBuilding = GetKeyBuilding( links[i] );
+		if ( !pBuilding )
 		{
 			continue;
 		}
@@ -1083,10 +1220,9 @@ void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets,
 				}
 			}
 		}
-		else if ( nOwnerParty != theDipl.GetNeutralParty() ||
-		          pBuilding->GetHitPoints() >= pBuilding->GetStats()->fMaxHP * 0.9f )
+		else if ( !IsBlockedByDamage( pBuilding ) || bCanRepair )
 		{
-			// A neutral key point under 90% health cannot be captured in this game mode (see CBuildingSimple::Segment).
+			// A damaged point too: the units hold it for the engineers and capture it once repaired.
 			pTargets->push_back( vCenter );
 		}
 	}
@@ -1168,6 +1304,7 @@ void CGeneralTaskCaptureKeyPoints::Segment()
 	timeNextOrders = curTime + BOT_ORDERS_PERIOD + NRandom::Random( BOT_ORDERS_PERIOD_RANDOM );
 	RecordRandomCall();
 
+	UpdateRepairs();
 	if ( !workers.empty() )
 	{
 		GiveOrders();

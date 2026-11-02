@@ -355,16 +355,39 @@ class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerat
 		}
 	};
 
+	// An engineer truck at work on a damaged key point
+	struct SRepair
+	{
+		ZDATA
+		CPtr<CCommonUnit> pTruck;
+		int nLink = {};
+		int nOrders = {}; // how many times it has been sent; a truck that can't get there gives up
+
+		ZEND int operator&( IBinSaver &f )
+		{
+			f.Add( 2, &pTruck );
+			f.Add( 3, &nLink );
+			f.Add( 4, &nOrders );
+			return 0;
+		}
+	};
+
 	ZDATA
 	CPtr<CGeneral> pOwner;
 	std::vector<SWorker> workers;
 	NTimer::STime timeNextOrders = {};
+	std::vector<SRepair> repairs;
+	std::vector<int> pointsToRepair; // links of damaged key points with no truck on the way
+	det_map<int, NTimer::STime> unreachablePoints; // link -> when to try repairing it again
 
 	ZEND int operator&( IBinSaver &f ) override
 	{
 		f.Add( 2, &pOwner );
 		f.Add( 3, &workers );
 		f.Add( 4, &timeNextOrders );
+		f.Add( 5, &repairs );
+		f.Add( 6, &pointsToRepair );
+		f.Add( 7, &unreachablePoints );
 		return 0;
 	}
 
@@ -372,6 +395,7 @@ class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerat
 
 	void CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints );
 	void GiveOrders();
+	void UpdateRepairs();
 
 public:
 	CGeneralTaskCaptureKeyPoints() {}
@@ -412,16 +436,14 @@ public:
 	// IWorkerEnumerator
 	bool EnumWorker( class CCommonUnit *pUnit, const enum EForceType eType ) override;
 
-	bool EvaluateWorker( CCommonUnit *pUnit, const enum EForceType eType ) const override
-	{
-		return true;
-	}
+	bool EvaluateWorker( CCommonUnit *pUnit, const enum EForceType eType ) const override;
 
 	// Asking for "the best several" makes the commander sort by rating. Unique IDs leave
 	// no ties for std::sort to order differently from one platform to another.
+	// Trucks go one at a time, the nearest to the point waiting for repair.
 	int NeedNBest( const enum EForceType eType ) const override
 	{
-		return 2;
+		return eType == FT_TRUCK_REPAIR_BUILDING ? 1 : 2;
 	}
 
 	float EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const override;
