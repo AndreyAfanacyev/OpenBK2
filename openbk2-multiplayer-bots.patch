@@ -1,0 +1,2209 @@
+diff --git a/Changes.md b/Changes.md
+index 68f412fa6..3ddc087fa 100644
+--- a/Changes.md
++++ b/Changes.md
+@@ -1,6 +1,8 @@
+ 
+ # Changes to the game
+ 
++- Multiplayer slots can be played by a bot. The host picks `Bot - Team 1` or `Bot - Team 2` in a slot's list in the game room, also over a player already sitting there. A bot is the single player AI general, run in every client's simulation, so it sends nothing over the network and lockstep doesn't wait for it: it calls reinforcements and aircraft, directs artillery and supply, and sends its units to take the key points its side doesn't hold, defending those under threat and attacking known resistance once it holds them all. It only reacts to what its side can see. A team of only bots can't announce its own defeat, so the game control host does. A match without bots simulates as before, but all players need this build: an older client doesn't know what a bot slot is.
++
+ - The game can run in a window instead of over the whole screen, for running two copies side by side when testing multiplayer: `--window=left` and `--window=right` put it in the top quarter of the primary screen on that side, and `--window=WxH+X+Y` anywhere. The window is borderless, so two of them tile edge to edge, and the picture is scaled into it as it is into the full screen. `./launch.sh -w` passes it, choosing left for the first game and right when one is already running. Nothing about it is saved in the profile.
+ 
+ - LAN games are found across computers on Linux. The game worked out where to broadcast its search from the address its own host name resolves to, and Debian, among others, resolves that to 127.0.1.1, so the search never left the computer and the game list stayed empty however many games were hosted next door. It now broadcasts on every network the computer is connected to, reading them from the network interfaces on Linux and Windows alike, and that also mends the address a joining player gives the host. On Windows it used to guess each network's size from its address, so a home network inside 10.0.0.0/8 was broadcast to as a whole 10.x.x.x; it now uses each network's real mask.
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/AILogicInternal.cpp b/Versions/Temporary/Engine/Sources/AILogic/AILogicInternal.cpp
+index de93d3541..0eff61bc2 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/AILogicInternal.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/AILogicInternal.cpp
+@@ -1328,6 +1328,15 @@ void CAILogic::InitAfterMapLoad( const struct NDb::SMapInfo *pMapInfo )
+ 	}
+ 	else if ( GetScenarioTracker()->GetGameType() == IAIScenarioTracker::EGT_MULTI_FLAG_CONTROL )
+ 	{
++		// Bots first: their generals have to exist to receive the starting units below.
++		theSupremeBeing.Init( pMapInfo );
++		std::list<CCommonUnit *> pUnits;
++		for ( CGlobalIter iter( 0, ANY_PARTY ); !iter.IsFinished(); iter.Iterate() )
++		{
++			pUnits.push_back( *iter );
++		}
++		theSupremeBeing.GiveNewUnitsToGenerals( pUnits );
++
+ 		// Call starting units reinforcement for this game mode
+ 		theReinfArray.PlaceInitialUnits();
+ 	}
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/AIUnit.cpp b/Versions/Temporary/Engine/Sources/AILogic/AIUnit.cpp
+index acdf57dc7..e8d18dea9 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/AIUnit.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/AIUnit.cpp
+@@ -1045,6 +1045,12 @@ void CAIUnit::FreezeSegment()
+ 
+ 		pUnitInfoForGeneral->Segment();
+ 	}
++	else if ( theSupremeBeing.HasGeneralInParty( 1 - GetParty() ) )
++	{
++		// Reports this unit's position to the enemy side's bots. It draws random numbers,
++		// which is fine in lockstep: this condition is the same on every client.
++		pUnitInfoForGeneral->Segment();
++	}
+ 
+ 	// обработка TankPit
+ 	if ( !IsValidObj( pTankPit ) )
+@@ -1087,8 +1093,11 @@ void CAIUnit::CalcVisibility( const bool bIgnoreTime )
+ 			if ( bVisibilityChanged )
+ 			{
+ 				theSupremeBeing.SetUnitVisible( this, i, bVisibility );
+-				if ( theDipl.GetNeutralPlayer() != GetPlayer() && !theDipl.IsAIPlayer( GetPlayer() ) &&
+-				     theDipl.IsAIPlayer( i ) )
++				// Net game: tell the bots of the side that can now see this enemy, bots' own units included.
++				const bool bReportToGeneral = theDipl.IsNetGame()
++				                                ? GetParty() != i && theSupremeBeing.HasGeneralInParty( i )
++				                                : !theDipl.IsAIPlayer( GetPlayer() ) && theDipl.IsAIPlayer( i );
++				if ( theDipl.GetNeutralPlayer() != GetPlayer() && bReportToGeneral )
+ 				{
+ 					pUnitInfoForGeneral->UpdateVisibility( bVisibility );
+ 				}
+@@ -1295,7 +1304,10 @@ void CAIUnit::Fired( const float fGunRadius, const int nGun )
+ 
+ void CAIUnit::UpdateUnitsRequestsForResupply()
+ {
+-	if ( !theDipl.IsNetGame() )
++	// Bots keep their own units supplied and pick up abandoned neutral guns, same as the single player general.
++	const bool bNeutralForBots = GetParty() == theDipl.GetNeutralParty() &&
++	                             ( theSupremeBeing.HasGeneralInParty( 0 ) || theSupremeBeing.HasGeneralInParty( 1 ) );
++	if ( !theDipl.IsNetGame() || theSupremeBeing.HasGeneralForPlayer( GetPlayer() ) || bNeutralForBots )
+ 	{
+ 		if ( !IsAlive() || IsRefInvalid() )
+ 		{
+@@ -1354,10 +1366,8 @@ void CAIUnit::ChangePlayer( const uint8_t cPlayer )
+ 	if ( GetParty() != theDipl.GetNParty( cPlayer ) )
+ 	{
+ 		theFeedBackSystem.RemovedAllFeedbacks( nUniqueID );
+-		if ( !theDipl.IsNetGame() )
+-		{
+-			theSupremeBeing.UnitChangedParty( this, theDipl.GetNParty( cPlayer ) );
+-		}
++		// Generals are empty in a net game without bots, so this is a no-op there.
++		theSupremeBeing.UnitChangedParty( this, theDipl.GetNParty( cPlayer ) );
+ 	}
+ 
+ 	if ( theBalanceTest.IsActive() && !theBalanceTest.HasShoot( GetPlayer() ) )
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.cpp b/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.cpp
+index 4ad830d16..7e8f2a182 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.cpp
+@@ -18,10 +18,12 @@ void CDiplomacy::Load( const std::vector<int> &_playerParty )
+ 	playerParty = _playerParty;
+ 	isPlayerExist.clear();
+ 	isPlayerExist.resize( playerParty.size(), 0 );
++	isPlayerBot.assign( playerParty.size(), 0 );
+ 
+ 	for ( int i = 0; i < isPlayerExist.size(); ++i )
+ 	{
+ 		isPlayerExist[i] = GetScenarioTracker()->IsPlayerPresent( i );
++		isPlayerBot[i] = isPlayerExist[i] && GetScenarioTracker()->IsPlayerBot( i );
+ 		if ( GetScenarioTracker()->IsMissionActive() )
+ 		{
+ 			int nScenarioParty = GetScenarioTracker()->GetPlayerSide( i );
+@@ -58,6 +60,7 @@ int CDiplomacy::operator&( IBinSaver &saver )
+ 		saver.Add( 2, &nMyNumber );
+ 		saver.Add( 3, &bNetGame );
+ 		saver.Add( 4, &isPlayerExist );
++		saver.Add( 5, &isPlayerBot );
+ 	}
+ 
+ 	return 0;
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.h b/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.h
+index b354ca3f8..2e2f02e5f 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/Diplomacy.h
+@@ -22,6 +22,7 @@ private:
+ 	int nMyNumber = {};
+ 
+ 	std::vector<int> isPlayerExist;
++	std::vector<int> isPlayerBot; // net game players driven by a CGeneral
+ 
+ 	bool bNetGame = {};
+ 
+@@ -96,7 +97,23 @@ public:
+ 
+ 	const bool IsAIPlayer( const uint8_t cPlayer ) const
+ 	{
+-		return !bNetGame && cPlayer != GetMyNumber();
++		// In a net game this must not depend on the local player: all clients have to agree.
++		return bNetGame ? IsPlayerBot( cPlayer ) : cPlayer != GetMyNumber();
++	}
++
++	const bool IsPlayerBot( const uint8_t cPlayer ) const
++	{
++		return cPlayer < isPlayerBot.size() && isPlayerBot[cPlayer] != 0;
++	}
++
++	// Test and lobby-independent setup; a match gets this from the scenario tracker in Load
++	void SetPlayerBot( const int nPlayer, const bool bBot )
++	{
++		if ( nPlayer >= isPlayerBot.size() )
++		{
++			isPlayerBot.resize( nPlayer + 1, 0 );
++		}
++		isPlayerBot[nPlayer] = bBot ? 1 : 0;
+ 	}
+ 
+ 	const uint8_t GetNeutralPlayer() const
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/General.h b/Versions/Temporary/Engine/Sources/AILogic/General.h
+index ef701a01a..161a69ad2 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/General.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/General.h
+@@ -74,4 +74,11 @@ public:
+ 	bool IsIronman( const int nScriptGroup ) const;
+ 
+ 	bool IsInResistanceCircle( const CVec2 &vPoint, const int nGeneralParty );
++
++	// In a net game a side can hold several bots, so generals are keyed by player there
++	bool HasGeneralInParty( const int nParty ) const;
++	bool HasGeneralForPlayer( const int nPlayer ) const;
++
++private:
++	CGeneral *GetGeneralOfUnit( const class CCommonUnit *pUnit );
+ };
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.cpp b/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.cpp
+index a697343c7..d7483a38d 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.cpp
+@@ -41,7 +41,7 @@ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4AE, CGeneralAirForce );
+ //*											CGeneralAirForce*
+ //*******************************************************************
+ 
+-CGeneralAirForce::CGeneralAirForce( const int nParty, IEnemyContainer *pEnemyContainer )
++CGeneralAirForce::CGeneralAirForce( const int nParty, const int nPlayer, IEnemyContainer *pEnemyContainer )
+ 	: pEnemyContainer( pEnemyContainer )
+ 	, nParty( nParty )
+ 	, bOurTurn( false )
+@@ -50,7 +50,8 @@ CGeneralAirForce::CGeneralAirForce( const int nParty, IEnemyContainer *pEnemyCon
+ {
+ 	for ( int i = 0; i < theDipl.GetNPlayers(); ++i )
+ 	{
+-		if ( theDipl.GetNParty( i ) == nParty )
++		// A net game side can hold other players whose reinforcements are not ours to call.
++		if ( theDipl.IsNetGame() ? i == nPlayer : theDipl.GetNParty( i ) == nParty )
+ 		{
+ 			players.push_back( i );
+ 		}
+@@ -78,7 +79,7 @@ void CGeneralAirForce::Segment()
+ 
+ 	for ( int i = 0; i < players.size(); ++i )
+ 	{
+-		if ( players[i] != theDipl.GetMyNumber() )
++		if ( theDipl.IsNetGame() || players[i] != theDipl.GetMyNumber() )
+ 		{
+ 			const int nPlayer = players[i];
+ 
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.h
+index 1499144a5..96d6fc9b0 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralAirForce.h
+@@ -96,7 +96,7 @@ private:
+ public:
+ 	CGeneralAirForce() {}
+ 
+-	CGeneralAirForce( const int nPlayer, IEnemyContainer *pEnemyContainer );
++	CGeneralAirForce( const int nParty, const int nPlayer, IEnemyContainer *pEnemyContainer );
+ 
+ 	void Segment() override;
+ 	void Give( CCommonUnit *pWorker ) override;
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralArtillery.cpp b/Versions/Temporary/Engine/Sources/AILogic/GeneralArtillery.cpp
+index 82687186b..f036f0f4e 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralArtillery.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralArtillery.cpp
+@@ -686,7 +686,10 @@ void CGeneralArtilleryTask::Segment()
+ 		bool bWrongParty = false;
+ 		if ( IsValidObj( pUnit ) )
+ 		{
+-			bWrongParty = !IsArtilleryBeingTowed( pUnit ) && pUnit->GetParty() == theDipl.GetMyParty();
++			// The local player must not decide this in a net game: every client has to agree.
++			bWrongParty = !IsArtilleryBeingTowed( pUnit ) &&
++			              ( theDipl.IsNetGame() ? !theDipl.IsPlayerBot( pUnit->GetPlayer() )
++			                                    : pUnit->GetParty() == theDipl.GetMyParty() );
+ 		}
+ 
+ 		if ( !IsValidObj( pUnit ) || bWrongParty )
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralBotObjectives.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralBotObjectives.h
+new file mode 100644
+index 000000000..d57816f7a
+--- /dev/null
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralBotObjectives.h
+@@ -0,0 +1,83 @@
++#pragma once
++
++// How a net game bot splits its units between objectives. Kept apart from the
++// units themselves so that the rules can be tested without a running simulation.
++// Runs inside the deterministic simulation: no unordered containers, and ties
++// always go to the lower index.
++
++#include <vector>
++
++namespace NBotObjectives
++{
++struct SWorker
++{
++	CVec2 vPosition;
++	int nTarget = -1; // index in targets; -1 needs a target
++};
++
++inline int FindTarget( const std::vector<CVec2> &targets, const CVec2 &vTarget )
++{
++	for ( int i = 0; i < targets.size(); ++i )
++	{
++		if ( targets[i] == vTarget )
++		{
++			return i;
++		}
++	}
++	return -1;
++}
++
++// No target is left without units while another has more than its share. A
++// worker whose target is still valid keeps it unless that target is over its
++// share, so that units don't turn back and forth every time the list changes.
++inline void AssignTargets( const std::vector<CVec2> &targets, std::vector<SWorker> *pWorkers )
++{
++	if ( targets.empty() )
++	{
++		return;
++	}
++
++	std::vector<SWorker> &workers = *pWorkers;
++	const int nShare = ( int( workers.size() ) + int( targets.size() ) - 1 ) / int( targets.size() );
++	std::vector<int> counts( targets.size(), 0 );
++	for ( int i = 0; i < workers.size(); ++i )
++	{
++		if ( workers[i].nTarget >= 0 )
++		{
++			if ( counts[workers[i].nTarget] >= nShare )
++			{
++				workers[i].nTarget = -1;
++			}
++			else
++			{
++				++counts[workers[i].nTarget];
++			}
++		}
++	}
++
++	for ( int i = 0; i < workers.size(); ++i )
++	{
++		if ( workers[i].nTarget >= 0 )
++		{
++			continue;
++		}
++
++		int nBest = -1;
++		float fBest = 0.0f;
++		for ( int j = 0; j < targets.size(); ++j )
++		{
++			if ( counts[j] < nShare )
++			{
++				const float fDistance = fabs2( targets[j] - workers[i].vPosition );
++				if ( nBest < 0 || fDistance < fBest )
++				{
++					nBest = j;
++					fBest = fDistance;
++				}
++			}
++		}
++		workers[i].nTarget = nBest;
++		++counts[nBest];
++	}
++}
++} // namespace NBotObjectives
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralConsts.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralConsts.h
+index 7564c0b27..604ff2786 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralConsts.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralConsts.h
+@@ -7,6 +7,9 @@ struct SGeneralConsts
+ {
+ 	static int TIME_DONT_SEE_ENEMY_BEFORE_FORGET;
+ 
++	// A bot stops calling ground reinforcements at this many units under its command
++	static const int BOT_MAX_UNITS = 60;
++
+ 	static int SCOUT_FREE_POINT;
+ 	static int SCOUT_POINTS;
+ 	static NTimer::STime TIME_SONT_SEE_AA_BEFORE_FORGET;
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.cpp b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.cpp
+index 0daea859b..89ee59c54 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.cpp
+@@ -129,7 +129,8 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
+ 	}
+ 
+ 	const int nScriptID = dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker );
+-	if ( IsMobileReinforcement( nScriptID ) || ( bFromReinforcement && nScriptID == -1 ) )
++	// A bot has no scripted defenders on a multiplayer map: everything it owns can fight.
++	if ( theDipl.IsNetGame() || IsMobileReinforcement( nScriptID ) || ( bFromReinforcement && nScriptID == -1 ) )
+ 	{
+ 		if ( pWorker->IsFormation() )
+ 		{
+@@ -175,7 +176,8 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
+ 				if ( pStats->IsTransport() )
+ 				{
+ 					const int nWorkerScriptID = dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker );
+-					if ( IsMobileReinforcement( nWorkerScriptID ) || ( bFromReinforcement && nWorkerScriptID == -1 ) )
++					if ( theDipl.IsNetGame() || IsMobileReinforcement( nWorkerScriptID ) ||
++					     ( bFromReinforcement && nWorkerScriptID == -1 ) )
+ 					{
+ 						if ( pStats->etype == RPG_TYPE_TRN_CIVILIAN_AUTO )
+ 						{
+@@ -203,7 +205,7 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
+ 				}
+ 				else
+ 				{
+-					if ( bFromReinforcement ||
++					if ( theDipl.IsNetGame() || bFromReinforcement ||
+ 					     IsMobileReinforcement( dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker ) ) )
+ 					{
+ 						tanksFree.push_back( pWorker );
+@@ -512,11 +514,11 @@ void CGeneral::Bombardment()
+ 			if ( cBombardmentType == 1 )
+ 			{
+ 				std::vector<EForceType> availFroces;
+-				if ( theReinfArray[nParty].HasReinforcement( NDb::RT_GROUND_ATTACK_PLANES ) )
++				if ( theReinfArray[nPlayer].HasReinforcement( NDb::RT_GROUND_ATTACK_PLANES ) )
+ 				{
+ 					availFroces.push_back( FT_AIR_GUNPLANE );
+ 				}
+-				if ( theReinfArray[nParty].HasReinforcement( NDb::RT_BOMBERS ) )
++				if ( theReinfArray[nPlayer].HasReinforcement( NDb::RT_BOMBERS ) )
+ 				{
+ 					availFroces.push_back( FT_AIR_BOMBER );
+ 				}
+@@ -651,7 +653,10 @@ void CGeneral::GiveNewUnits( const std::list<CCommonUnit *> &pUnits, bool bFromR
+ 	for ( std::list<CCommonUnit *>::const_iterator iter = pUnits.begin(); iter != pUnits.end(); ++iter )
+ 	{
+ 		CCommonUnit *pUnit = *iter;
+-		if ( theDipl.GetDiplStatusForParties( pUnit->GetParty(), nParty ) == EDI_FRIEND )
++		// A net game side can hold a person and a bot, and the bot must not take over allies' units.
++		const bool bOwned = theDipl.IsNetGame() ? pUnit->GetPlayer() == nPlayer
++		                                        : theDipl.GetDiplStatusForParties( pUnit->GetParty(), nParty ) == EDI_FRIEND;
++		if ( bOwned )
+ 		{
+ 			if ( pUnit->IsInFormation() && pUnit->GetFormation()->GetState()->GetName() != EUSN_GUN_CREW_STATE )
+ 			{
+@@ -686,12 +691,21 @@ void CGeneral::Init()
+ {
+ 	bSendReserves = false;
+ 	SGeneralConsts::Init();
+-	pAirForce = new CGeneralAirForce( nParty, this );
++	pAirForce = new CGeneralAirForce( nParty, nPlayer, this );
+ 	pGeneralArtillery = new CGeneralArtillery( this );
+ 	pIntendant = new CGeneralIntendant( nParty, this );
+ 	pIntendant->Init();
+ 
+-	tasks.push_back( new CGeneralTaskToSwarmToPoint( this ) );
++	if ( theDipl.IsNetGame() )
++	{
++		// Key points decide a multiplayer match. This task also attacks known resistance,
++		// so the swarm task would only compete with it for the same units.
++		tasks.push_back( new CGeneralTaskCaptureKeyPoints( this ) );
++	}
++	else
++	{
++		tasks.push_back( new CGeneralTaskToSwarmToPoint( this ) );
++	}
+ 
+ 	curProcessed = enemys.begin();
+ 
+@@ -709,6 +723,13 @@ void CGeneral::Init( const NDb::SAIGeneralSide &mapInfo )
+ 
+ 	Init();
+ 
++	if ( theDipl.IsNetGame() )
++	{
++		// Map parcels describe a scripted defence, which multiplayer maps don't have.
++		nMaxAllowedMobileTanks = SGeneralConsts::BOT_MAX_UNITS;
++		return;
++	}
++
+ 	bool bReinforceCreated = false;
+ 
+ 	for ( int i = 0; i < mapInfo.parcels.size(); ++i )
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.h
+index 3cee1207e..f7d557502 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternal.h
+@@ -64,6 +64,7 @@ class CGeneral : public CCommander, public IEnemyContainer
+ 	uint8_t cBombardmentType = {};
+ 	bool bSendReserves = {}; // send tanks to swarm
+ 	int nMaxAllowedMobileTanks = {};
++	int nPlayer = -1; // equal to nParty in single player; a net game side can hold several bots
+ 
+ public:
+ 	ZEND int operator&( IBinSaver &f ) override
+@@ -92,6 +93,7 @@ public:
+ 		f.Add( 21, &cBombardmentType );
+ 		f.Add( 22, &bSendReserves );
+ 		f.Add( 23, &nMaxAllowedMobileTanks );
++		f.Add( 24, &nPlayer );
+ 		return 0;
+ 	}
+ 
+@@ -134,6 +136,17 @@ public:
+ 
+ 	CGeneral( const int _nParty )
+ 		: nParty( _nParty )
++		, nPlayer( _nParty )
++		, lastBombardmentCheck( 0 )
++		, timeNextUpdate( 1000 )
++		, nAirReinfTurnCounter( 0 )
++	{
++		curProcessed = enemys.end();
++	}
++
++	CGeneral( const int _nParty, const int _nPlayer )
++		: nParty( _nParty )
++		, nPlayer( _nPlayer )
+ 		, lastBombardmentCheck( 0 )
+ 		, timeNextUpdate( 1000 )
+ 		, nAirReinfTurnCounter( 0 )
+@@ -204,4 +217,9 @@ public:
+ 	{
+ 		return nParty;
+ 	}
++
++	int GetPlayer() const
++	{
++		return nPlayer;
++	}
+ };
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternalInterfaces.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternalInterfaces.h
+index be7c90aa7..81c3b3ba3 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralInternalInterfaces.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralInternalInterfaces.h
+@@ -16,6 +16,7 @@ enum ETaskName
+ 	ETN_INTENDANT,
+ 	ETN_RESUPPLYCELL,
+ 	ETN_SWARM_TO_POINT,
++	ETN_CAPTURE_KEY_POINTS,
+ };
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralRearManager.cpp b/Versions/Temporary/Engine/Sources/AILogic/GeneralRearManager.cpp
+index b48919126..be7a57205 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralRearManager.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralRearManager.cpp
+@@ -1,5 +1,6 @@
+ #include "stdafx.h"
+ 
++#include "Diplomacy.h"
+ #include "Formation.h"
+ #include "GeneralAirForce.h"
+ #include "GeneralInternal.h"
+@@ -192,7 +193,9 @@ void CGeneral::BalanceUpdate( EBalanceAction eAction, CCommonUnit *_pUnit )
+ 		effects[i] = 0.0;
+ 
+ 		// Get availability for enemy
+-		nAvail = theReinfArray[nUnitParty].GetUnitAvailability( eUType, NDb::EReinforcementType( i ) );
++		// The array is per player. A party number only happens to match one in single player.
++		nAvail = theReinfArray[theDipl.IsNetGame() ? pUnit->GetPlayer() : nUnitParty].GetUnitAvailability(
++				eUType, NDb::EReinforcementType( i ) );
+ 
+ 		if ( nAvail )
+ 		{
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.cpp b/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.cpp
+index 8a13854b1..9a4d8524f 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.cpp
+@@ -2,8 +2,12 @@
+ 
+ #include "B2AI.h"
+ #include "DebugTools/DebugInfoManager.h"
++#include "Building.h"
+ #include "Formation.h"
++#include "KeyBuildingBonusSystem.h"
++#include "LinkObject.h"
+ #include "GeneralConsts.h"
++#include "GeneralBotObjectives.h"
+ #include "GeneralHelper.h"
+ #include "GeneralInternal.h"
+ #include "GeneralTasks.h"
+@@ -26,6 +30,7 @@ extern NTimer::STime curTime;
+ extern CDiplomacy theDipl;
+ extern CGroupLogic theGroupLogic;
+ extern CUnitCreation theUnitCreation;
++extern CKeyBuildingBonusSystem theBonusSystem;
+ const float GetWeightOfUnit( const SUnitBaseRPGStats *pStats );
+ 
+ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D489, CGeneralSwarmWaitForReady );
+@@ -33,6 +38,7 @@ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D48A, CGeneralTaskToSwarmToPoint );
+ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D499, CGeneralTaskRecaptureStorage );
+ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4B1, CGeneralTaskToHoldReinforcement );
+ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4B2, CGeneralTaskToDefendPatch );
++REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4F1, CGeneralTaskCaptureKeyPoints );
+ 
+ //*******************************************************************
+ //*											CGeneralTaskToDefendPatch										*
+@@ -204,7 +210,7 @@ void CGeneralTaskToDefendPatch::CalcSeverity( const bool bEnemyUpdated, const bo
+ 	if ( bEnemyUpdated )
+ 	{
+ 		fEnemyForce = 0;
+-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveEnemies( this );
++		pOwner->GiveEnemies( this );
+ 	}
+ 
+ 	if ( bFriendlyUpdated )
+@@ -227,7 +233,7 @@ void CGeneralTaskToDefendPatch::CalcSeverity( const bool bEnemyUpdated, const bo
+ 
+ void CGeneralTaskToDefendPatch::CancelTask( ICommander *pManager )
+ {
+-	theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->RemoveResistance( patchInfo.vCenter );
++	pOwner->RemoveResistance( patchInfo.vCenter );
+ 
+ 	for ( CommonUnits::iterator it = infantryInTrenches.begin(); infantryInTrenches.end() != it; ++it )
+ 	{
+@@ -299,12 +305,12 @@ void CGeneralTaskToDefendPatch::Segment()
+ 	if ( fFriendlyForce == 0.0f && !bResistanceRemoved ) // all stationary defenders are killed
+ 	{
+ 		bResistanceRemoved = true;
+-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->RemoveResistance( patchInfo.vCenter );
++		pOwner->RemoveResistance( patchInfo.vCenter );
+ 	}
+ 	if ( fFriendlyForce != 0.0f && bResistanceRemoved )
+ 	{
+ 		bResistanceRemoved = false;
+-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->AddResistance( patchInfo.vCenter, patchInfo.fRadius );
++		pOwner->AddResistance( patchInfo.vCenter, patchInfo.fRadius );
+ 	}
+ }
+ 
+@@ -831,7 +837,7 @@ void CGeneralTaskToSwarmToPoint::Segment()
+ 				//fSeverity = - 1;
+ 				fSeverity = 0;
+ 				ClearResistanceToAcceptNewTask();
+-				theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveResistances( this );
++				pOwner->GiveResistances( this );
+ 
+ 				// wait for some time
+ 				bReleaseWorkers = !curResistanceToAttack.IsInitted();
+@@ -911,7 +917,7 @@ void CGeneralTaskToSwarmToPoint::Segment()
+ 						}
+ 
+ 						ClearResistanceToAcceptNewTask();
+-						theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveResistances( this );
++						pOwner->GiveResistances( this );
+ 						if ( curResistanceToAttack.IsInitted() )
+ 						{
+ 							SendToGroupPoint();
+@@ -997,3 +1003,173 @@ bool CGeneralTaskToSwarmToPoint::EvaluateWorker( CCommonUnit *pUnit, const enum
+ 
+ 	return true;
+ }
++
++//*******************************************************************
++//*								CGeneralTaskCaptureKeyPoints								*
++//*******************************************************************
++namespace
++{
++// Enemies this close to a key point of ours mean it needs defending
++const float BOT_THREAT_RADIUS = 1000.0f;
++// Orders are only looked at this often; units keep their current order in between
++const int BOT_ORDERS_PERIOD = 6000;
++const int BOT_ORDERS_PERIOD_RANDOM = 2000;
++} // namespace
++
++void CGeneralTaskCaptureKeyPoints::AskForWorker( ICommander *pManager, const float fMaxSeverity, const bool bInit )
++{
++	pManager->EnumWorkers( FT_SWARMING_TANKS, this );
++	pManager->EnumWorkers( FT_FREE_INFANTRY, this );
++}
++
++float CGeneralTaskCaptureKeyPoints::EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const
++{
++	return float( pUnit->GetUniqueId() );
++}
++
++bool CGeneralTaskCaptureKeyPoints::EnumWorker( CCommonUnit *pUnit, const enum EForceType eType )
++{
++	SWorker &worker = workers.emplace_back();
++	worker.pUnit = pUnit;
++	return true;
++}
++
++void CGeneralTaskCaptureKeyPoints::CancelTask( ICommander *pManager )
++{
++	for ( int i = 0; i < workers.size(); ++i )
++	{
++		if ( IsValidObj( workers[i].pUnit ) )
++		{
++			pManager->Give( workers[i].pUnit );
++		}
++	}
++	workers.clear();
++}
++
++bool CGeneralTaskCaptureKeyPoints::EnumResistances( const SResistance &resistance )
++{
++	if ( resistance.GetWeight() > SGeneralConsts::MIN_WEIGHT_TO_SEND_SWARM )
++	{
++		resistanceCenters.push_back( resistance.GetResistanceCellCenter() );
++	}
++	return true;
++}
++
++void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints )
++{
++	const int nParty = pOwner->GetParty();
++	std::vector<int> links;
++	theBonusSystem.GetKeyBuildingLinks( &links );
++	for ( int i = 0; i < links.size(); ++i )
++	{
++		CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( links[i] ) );
++		if ( !pBuilding || !pBuilding->IsAlive() )
++		{
++			continue;
++		}
++
++		const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
++		const int nOwnerParty = theDipl.GetNParty( pBuilding->GetPlayer() );
++		if ( nOwnerParty == nParty )
++		{
++			pOwnPoints->push_back( vCenter );
++			for ( CUnitsIter<0, 3> iter( nParty, EDI_ENEMY, vCenter, BOT_THREAT_RADIUS ); !iter.IsFinished(); iter.Iterate() )
++			{
++				// Visibility check: a bot only reacts to what its side can really see.
++				if ( ( *iter )->IsAlive() && ( *iter )->IsVisible( nParty ) && !( *iter )->GetStats()->IsAviation() )
++				{
++					pTargets->push_back( vCenter );
++					break;
++				}
++			}
++		}
++		else if ( nOwnerParty != theDipl.GetNeutralParty() ||
++		          pBuilding->GetHitPoints() >= pBuilding->GetStats()->fMaxHP * 0.9f )
++		{
++			// A neutral key point under 90% health cannot be captured in this game mode (see CBuildingSimple::Segment).
++			pTargets->push_back( vCenter );
++		}
++	}
++
++	// Key points first; once the side holds them all, go after whatever it knows about.
++	if ( pTargets->empty() )
++	{
++		resistanceCenters.clear();
++		pOwner->GiveResistances( this );
++		pTargets->insert( pTargets->end(), resistanceCenters.begin(), resistanceCenters.end() );
++		resistanceCenters.clear();
++	}
++}
++
++void CGeneralTaskCaptureKeyPoints::GiveOrders()
++{
++	std::vector<CVec2> targets;
++	std::vector<CVec2> ownPoints;
++	CollectTargets( &targets, &ownPoints );
++	if ( targets.empty() )
++	{
++		targets = ownPoints; // Nothing to attack: stand on what we hold
++	}
++	if ( targets.empty() )
++	{
++		return;
++	}
++
++	std::vector<NBotObjectives::SWorker> plan( workers.size() );
++	for ( int i = 0; i < workers.size(); ++i )
++	{
++		plan[i].vPosition = workers[i].pUnit->GetCenterPlain();
++		plan[i].nTarget = -1;
++		if ( workers[i].bHasTarget )
++		{
++			plan[i].nTarget = NBotObjectives::FindTarget( targets, workers[i].vTarget );
++		}
++	}
++	NBotObjectives::AssignTargets( targets, &plan );
++
++	for ( int i = 0; i < workers.size(); ++i )
++	{
++		SWorker &worker = workers[i];
++		const CVec2 vTarget = targets[plan[i].nTarget];
++		const bool bNewTarget = !worker.bHasTarget || worker.vTarget != vTarget;
++		const float fCaptureRadius = SConsts::RADIUS_TO_TAKE_STORAGE_OWNERSHIP * 0.8f;
++		const bool bIdle = worker.pUnit->GetState() && worker.pUnit->GetState()->IsRestState();
++		worker.vTarget = vTarget;
++		worker.bHasTarget = true;
++
++		if ( bNewTarget )
++		{
++			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
++		}
++		else if ( bIdle && fabs( worker.pUnit->GetCenterPlain() - vTarget ) > fCaptureRadius )
++		{
++			// Arrived without getting into capture range, or the swarm ended early.
++			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
++		}
++	}
++}
++
++void CGeneralTaskCaptureKeyPoints::Segment()
++{
++	const int nPlayer = pOwner->GetPlayer();
++	for ( int i = workers.size() - 1; i >= 0; --i )
++	{
++		// Dead, or given to an ally with the unit transfer order
++		if ( !IsValidObj( workers[i].pUnit ) || workers[i].pUnit->GetPlayer() != nPlayer )
++		{
++			workers.erase( workers.begin() + i );
++		}
++	}
++
++	if ( curTime < timeNextOrders )
++	{
++		return;
++	}
++	timeNextOrders = curTime + BOT_ORDERS_PERIOD + NRandom::Random( BOT_ORDERS_PERIOD_RANDOM );
++	RecordRandomCall();
++
++	if ( !workers.empty() )
++	{
++		GiveOrders();
++	}
++}
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.h b/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.h
+index 43a5f9e1b..6e507818a 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/GeneralTasks.h
+@@ -331,3 +331,106 @@ public:
+ 		pGeneralTask->Run();
+ 	}
+ };
++
++// ****
++// Net game bots: take the key points that decide a match, and fight what is known about on the way.
++// ****
++class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerator, public IEnemyEnumerator
++{
++	OBJECT_BASIC_METHODS( CGeneralTaskCaptureKeyPoints );
++
++	struct SWorker
++	{
++		ZDATA
++		CPtr<CCommonUnit> pUnit;
++		CVec2 vTarget;
++		bool bHasTarget = {};
++
++		ZEND int operator&( IBinSaver &f )
++		{
++			f.Add( 2, &pUnit );
++			f.Add( 3, &vTarget );
++			f.Add( 4, &bHasTarget );
++			return 0;
++		}
++	};
++
++	ZDATA
++	CPtr<CGeneral> pOwner;
++	std::vector<SWorker> workers;
++	NTimer::STime timeNextOrders = {};
++
++	ZEND int operator&( IBinSaver &f ) override
++	{
++		f.Add( 2, &pOwner );
++		f.Add( 3, &workers );
++		f.Add( 4, &timeNextOrders );
++		return 0;
++	}
++
++	std::vector<CVec2> resistanceCenters; // only filled while enumerating, see EnumResistances
++
++	void CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints );
++	void GiveOrders();
++
++public:
++	CGeneralTaskCaptureKeyPoints() {}
++
++	CGeneralTaskCaptureKeyPoints( class CGeneral *_pOwner )
++		: pOwner( _pOwner )
++	{
++	}
++
++	ETaskName GetName() const override
++	{
++		return ETN_CAPTURE_KEY_POINTS;
++	}
++
++	void AskForWorker( ICommander *pManager, const float fMaxSeverity, const bool bInit = false ) override;
++
++	// Nothing to give back: on a multiplayer map every unit has a key point to go to
++	void ReleaseWorker( ICommander *pManager, const float fMinSeverity ) override {}
++
++	float GetSeverity() const override
++	{
++		return 0.0f;
++	}
++
++	bool IsFinished() const override
++	{
++		return false;
++	}
++
++	void CancelTask( ICommander *pManager ) override;
++	void Segment() override;
++
++	int GetWorkerCount() override
++	{
++		return workers.size();
++	}
++
++	// IWorkerEnumerator
++	bool EnumWorker( class CCommonUnit *pUnit, const enum EForceType eType ) override;
++
++	bool EvaluateWorker( CCommonUnit *pUnit, const enum EForceType eType ) const override
++	{
++		return true;
++	}
++
++	// Asking for "the best several" makes the commander sort by rating. Unique IDs leave
++	// no ties for std::sort to order differently from one platform to another.
++	int NeedNBest( const enum EForceType eType ) const override
++	{
++		return 2;
++	}
++
++	float EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const override;
++
++	// IEnemyEnumerator
++	bool EnumEnemy( class CAIUnit *pEnemy ) override
++	{
++		return false;
++	}
++
++	bool EnumResistances( const struct SResistance &resistance ) override;
++};
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.cpp b/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.cpp
+index b607dd7d5..9ccd4034a 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.cpp
+@@ -29,6 +29,15 @@ bool CKeyBuildingBonusSystem::IsStorage( int nLinkID ) const
+ 	return pos != buildingBonuses.end() && pos->second.bStorage;
+ }
+ 
++void CKeyBuildingBonusSystem::GetKeyBuildingLinks( std::vector<int> *pLinks ) const
++{
++	pLinks->clear();
++	for ( CBuildingBonuses::const_iterator it = buildingBonuses.begin(); it != buildingBonuses.end(); ++it )
++	{
++		pLinks->push_back( it->first );
++	}
++}
++
+ bool CKeyBuildingBonusSystem::IsKeyBuilding( int nLinkID ) const
+ {
+ 	CBuildingBonuses::const_iterator pos = buildingBonuses.find( nLinkID );
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.h b/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.h
+index 5d06b4b2e..a6f12b04d 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/KeyBuildingBonusSystem.h
+@@ -26,6 +26,8 @@ public:
+ 	bool IsStorage( int nLinkID ) const;
+ 	void InitBonusSystem( const NDb::SMapInfo *pMapInfo );
+ 	bool IsKeyBuilding( int nLinkID ) const;
++	// Bots go after these. Link IDs in ascending order, so every client sees the same list.
++	void GetKeyBuildingLinks( std::vector<int> *pLinks ) const;
+ 
+ 	void SendUpdates() const;
+ 
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/ScenarioTracker.h b/Versions/Temporary/Engine/Sources/AILogic/ScenarioTracker.h
+index fe0039081..92ecf383e 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/ScenarioTracker.h
++++ b/Versions/Temporary/Engine/Sources/AILogic/ScenarioTracker.h
+@@ -93,6 +93,14 @@ struct IAIScenarioTracker : public CObjectBase
+ 	virtual void AddPlayer( const int nPlayer ) = 0;
+ 	virtual void RemovePlayer( const int nPlayer ) = 0;
+ 	virtual bool IsPlayerPresent( const int nPlayer ) const = 0;
++
++	// A multiplayer slot played by the AI general instead of a person. Every client
++	// reads the same value, so the general runs identically in all simulations.
++	virtual bool IsPlayerBot( const int nPlayer ) const
++	{
++		return false;
++	}
++
+ 	virtual int GetLocalPlayer() const = 0;
+ 	virtual void SetLocalPlayer( int nPlayer ) = 0;
+ 	virtual int GetNPlayers() const = 0;
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/SupremeBeing.cpp b/Versions/Temporary/Engine/Sources/AILogic/SupremeBeing.cpp
+index 51c85ad42..88866d631 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/SupremeBeing.cpp
++++ b/Versions/Temporary/Engine/Sources/AILogic/SupremeBeing.cpp
+@@ -23,17 +23,23 @@ struct IEnemyContainer *CSupremeBeing::GetEnemyConatiner( int nParty )
+ 
+ void CSupremeBeing::SetAAVisible( class CAIUnit *pUnit, const int nGeneralParty, const bool bVisible )
+ {
+-	if ( generals.find( nGeneralParty ) != generals.end() )
++	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
+ 	{
+-		generals[nGeneralParty]->SetAAVisible( pUnit, bVisible );
++		if ( it->second->GetParty() == nGeneralParty )
++		{
++			it->second->SetAAVisible( pUnit, bVisible );
++		}
+ 	}
+ }
+ 
+ void CSupremeBeing::SetUnitVisible( class CAIUnit *pUnit, const int nGeneralParty, const bool bVisible )
+ {
+-	if ( generals.find( nGeneralParty ) != generals.end() )
++	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
+ 	{
+-		generals[nGeneralParty]->SetUnitVisible( pUnit, bVisible );
++		if ( it->second->GetParty() == nGeneralParty )
++		{
++			it->second->SetUnitVisible( pUnit, bVisible );
++		}
+ 	}
+ }
+ 
+@@ -50,7 +56,20 @@ void CSupremeBeing::Clear()
+ 
+ void CSupremeBeing::Init( const NDb::SMapInfo *pMapInfo )
+ {
+-	if ( !NGlobal::GetVar( "nogeneral", 0 ) && !theDipl.IsNetGame() )
++	if ( theDipl.IsNetGame() )
++	{
++		// One general per bot, in every client's simulation. The "nogeneral" console
++		// variable is deliberately not read here: it is per-client and would desync.
++		for ( int i = 0; i < pMapInfo->players.size(); ++i )
++		{
++			if ( theDipl.IsPlayerBot( i ) )
++			{
++				generals[i] = new CGeneral( theDipl.GetNParty( i ), i );
++				generals[i]->Init( pMapInfo->players[i].general );
++			}
++		}
++	}
++	else if ( !NGlobal::GetVar( "nogeneral", 0 ) )
+ 	{
+ 		for ( int i = 0; i < pMapInfo->players.size(); ++i )
+ 		{
+@@ -67,7 +86,15 @@ void CSupremeBeing::Init( const NDb::SMapInfo *pMapInfo )
+ 
+ void CSupremeBeing::GiveNewUnitsToGenerals( const std::list<CCommonUnit *> &pUnits, bool bFromReinforcement )
+ {
+-	if ( !NGlobal::GetVar( "nogeneral", 0 ) && !theDipl.IsNetGame() )
++	if ( theDipl.IsNetGame() )
++	{
++		// Each bot filters out its own player's units.
++		for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
++		{
++			it->second->GiveNewUnits( pUnits, true );
++		}
++	}
++	else if ( !NGlobal::GetVar( "nogeneral", 0 ) )
+ 	{
+ 		generals[1]->GiveNewUnits( pUnits, bFromReinforcement );
+ 	}
+@@ -85,14 +112,40 @@ bool CSupremeBeing::IsIronman( const int nScriptGroup ) const
+ 
+ bool CSupremeBeing::IsMobileReinforcement( int nParty, int nGroup ) const
+ {
+-	Generals::const_iterator it = generals.find( nParty );
+-	if ( it != generals.end() )
++	for ( Generals::const_iterator it = generals.begin(); it != generals.end(); ++it )
+ 	{
+-		return ( it->second )->IsMobileReinforcement( nGroup );
++		if ( it->second->GetParty() == nParty && it->second->IsMobileReinforcement( nGroup ) )
++		{
++			return true;
++		}
+ 	}
+ 	return false;
+ }
+ 
++bool CSupremeBeing::HasGeneralInParty( const int nParty ) const
++{
++	for ( Generals::const_iterator it = generals.begin(); it != generals.end(); ++it )
++	{
++		if ( it->second->GetParty() == nParty )
++		{
++			return true;
++		}
++	}
++	return false;
++}
++
++bool CSupremeBeing::HasGeneralForPlayer( const int nPlayer ) const
++{
++	return generals.find( nPlayer ) != generals.end();
++}
++
++CGeneral *CSupremeBeing::GetGeneralOfUnit( const CCommonUnit *pUnit )
++{
++	// Single player: the one general owns its whole party. Net game: a bot owns only its player's units.
++	const Generals::iterator it = generals.find( theDipl.IsNetGame() ? pUnit->GetPlayer() : pUnit->GetParty() );
++	return it == generals.end() ? 0 : it->second.GetPtr();
++}
++
+ void CSupremeBeing::AddReinforcement( class CAIUnit *pUnit )
+ {
+ 	if ( generals.find( pUnit->GetPlayer() ) != generals.end() )
+@@ -103,9 +156,9 @@ void CSupremeBeing::AddReinforcement( class CAIUnit *pUnit )
+ 
+ void CSupremeBeing::Segment()
+ {
+-	if ( !NGlobal::GetVar( "temp.nogeneral_sript", 0 ) )
++	if ( theDipl.IsNetGame() || !NGlobal::GetVar( "temp.nogeneral_sript", 0 ) )
+ 	{
+-		if ( !theDipl.IsNetGame() )
++		// Empty in a net game without bots, so such a match runs exactly as before.
+ 		{
+ 			// запуск отложенных заждач
+ 			for ( DelayedTasks::iterator it = delayedTasks.begin(); it != delayedTasks.end(); )
+@@ -145,14 +198,17 @@ void CSupremeBeing::UpdateEnemyUnitInfo( CAIUnitInfoForGeneral *pInfo,
+ {
+ 	const int nGeneralParty = 1 - pInfo->GetOwner()->GetParty();
+ 
+-	if ( nGeneralParty == 1 && generals.find( nGeneralParty ) != generals.end() )
++	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
+ 	{
+-		generals[nGeneralParty]->UpdateEnemyUnitInfo( pInfo,
+-		                                              lastVisibleTimeDelta,
+-		                                              vLastVisiblePos,
+-		                                              lastAntiArtTimeDelta,
+-		                                              vLastVisibleAntiArtCenter,
+-		                                              fDistToLastVisibleAntiArt );
++		if ( it->second->GetParty() == nGeneralParty )
++		{
++			it->second->UpdateEnemyUnitInfo( pInfo,
++			                                 lastVisibleTimeDelta,
++			                                 vLastVisiblePos,
++			                                 lastAntiArtTimeDelta,
++			                                 vLastVisibleAntiArtCenter,
++			                                 fDistToLastVisibleAntiArt );
++		}
+ 	}
+ }
+ 
+@@ -176,10 +232,9 @@ void CSupremeBeing::UnitChangedPosition( class CCommonUnit *pUnit, const CVec2 &
+ {
+ 	if ( AICellsTiles::GetGeneralCell( pUnit->GetCenterPlain() ) != AICellsTiles::GetGeneralCell( vNewPos ) )
+ 	{
+-		Generals::iterator it = generals.find( pUnit->GetParty() );
+-		if ( it != generals.end() )
++		if ( CGeneral *pGeneral = GetGeneralOfUnit( pUnit ) )
+ 		{
+-			it->second->UnitChangedPosition( pUnit, vNewPos );
++			pGeneral->UnitChangedPosition( pUnit, vNewPos );
+ 		}
+ 	}
+ }
+@@ -200,10 +255,9 @@ void CSupremeBeing::UnitAskedForResupply( class CCommonUnit *pUnit, const EResup
+ 	}
+ 	else
+ 	{
+-		Generals::iterator it = generals.find( pUnit->GetParty() );
+-		if ( it != generals.end() )
++		if ( CGeneral *pGeneral = GetGeneralOfUnit( pUnit ) )
+ 		{
+-			it->second->UnitAskedForResupply( pUnit, eType, bSet );
++			pGeneral->UnitAskedForResupply( pUnit, eType, bSet );
+ 		}
+ 	}
+ }
+@@ -221,9 +275,12 @@ void CSupremeBeing::UnitChangedParty( CAIUnit *pUnit, const int nNewParty )
+ 
+ bool CSupremeBeing::IsInResistanceCircle( const CVec2 &vPoint, const int nGeneralParty )
+ {
+-	if ( generals.find( nGeneralParty ) != generals.end() )
++	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
+ 	{
+-		return generals[nGeneralParty]->IsInResistanceCircle( vPoint );
++		if ( it->second->GetParty() == nGeneralParty && it->second->IsInResistanceCircle( vPoint ) )
++		{
++			return true;
++		}
+ 	}
+ 	return false;
+ }
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/test/CMakeLists.txt b/Versions/Temporary/Engine/Sources/AILogic/test/CMakeLists.txt
+index 4368cd277..bf12b5e3c 100644
+--- a/Versions/Temporary/Engine/Sources/AILogic/test/CMakeLists.txt
++++ b/Versions/Temporary/Engine/Sources/AILogic/test/CMakeLists.txt
+@@ -112,3 +112,16 @@ if(WIN32)
+     set_tests_properties(ScriptGroupWait_test PROPERTIES
+         ENVIRONMENT_MODIFICATION "PATH=path_list_append:${FFMPEG_BIN}")
+ endif()
++
++# Net game bots. Linux only for now: these tests reach simulation classes that the AILogic DLL doesn't export on Windows.
++if(NOT WIN32)
++    # How bots share units between key points, and that bots don't depend on the local player.
++    add_unit_test(NetBotObjectives AILogic Common_RTS_AI Stats_B2_M1 libdb System Misc zlib gr2)
++    set_tests_properties(NetBotObjectives_test PROPERTIES TIMEOUT 60)
++
++    # A bot end to end on real units and the real general, from each client's point of view.
++    add_unit_test(NetBotGeneral AILogic Common_RTS_AI Stats_B2_M1 libdb System Misc zlib gr2)
++    target_compile_definitions(NetBotGeneral_test PRIVATE
++        NET_BOT_TYPES_FILE="${CMAKE_SOURCE_DIR}/Versions/Current/Data/types.xml")
++    set_tests_properties(NetBotGeneral_test PROPERTIES TIMEOUT 60)
++endif()
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/test/NetBotGeneral.cpp b/Versions/Temporary/Engine/Sources/AILogic/test/NetBotGeneral.cpp
+new file mode 100644
+index 000000000..67f68a705
+--- /dev/null
++++ b/Versions/Temporary/Engine/Sources/AILogic/test/NetBotGeneral.cpp
+@@ -0,0 +1,352 @@
++#include "../stdafx.h"
++
++// A net game bot end to end, on real units and the real general: whatever player
++// sits at the local keyboard, the bot takes its own units, leaves its ally's
++// alone, and sends them to the key point its side doesn't hold.
++
++#include "../AIClassesID.h"
++#include "../B2AI.h"
++#include "../Building.h"
++#include "../Commands.h"
++#include "../DBAIConsts.h"
++#include "../Diplomacy.h"
++#include "../General.h"
++#include "../GroupLogic.h"
++#include "../KeyBuildingBonusSystem.h"
++#include "../LinkObject.h"
++#include "../PlayerReinforcement.h"
++#include "../Reinforcement.h"
++#include "../StaticMembers.h"
++#include "../Technics.h"
++#include "../UnitGuns.h"
++#include "../Units.h"
++#include "../UnitStates.h"
++#include "Common_RTS_AI/AIMap.h"
++#include "Common_RTS_AI/CommonPathFinder.h"
++#include "libdb/Db.h"
++#include "libdb/EditorDb.h"
++#include "libdb/ObjMan.h"
++#include "Stats_B2_M1/DBMapInfo.h"
++#include "System/VFSOperations.h"
++#include "System/WinVFS.h"
++
++#include <chrono>
++#include <filesystem>
++#include <functional>
++#include <list>
++#include <string>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++extern CSupremeBeing theSupremeBeing;
++extern CKeyBuildingBonusSystem theBonusSystem;
++extern CPlayerReinforcementArray theReinfArray;
++extern NTimer::STime curTime;
++extern CGroupLogic theGroupLogic;
++
++namespace
++{
++const int KEY_POINT_LINK = 7;
++const CVec2 KEY_POINT( 1600, 1600 );
++
++enum
++{
++	PLAYER_ENEMY = 0,
++	PLAYER_BOT = 1,
++	PLAYER_ALLY = 2,
++	PLAYER_SECOND_BOT = 3,
++	N_PLAYERS = 4
++};
++
++struct SFields
++{
++	std::function<void( IBinSaver & )> visit;
++
++	int operator&( IBinSaver &saver )
++	{
++		visit( saver );
++		return 0;
++	}
++};
++
++class NetBotGeneral : public testing::TestWithParam<int>
++{
++	static inline std::filesystem::path directory;
++	std::vector<CObj<NDb::IObjMan>> records;
++	std::vector<CObj<CObjectBase>> objects;
++	std::vector<SBinSaverExternalObject> external;
++	CObj<CAIMap> map;
++	CObj<NDb::SUnitStatsModifier> modifier;
++	CDBPtr<NDb::SMechUnitRPGStats> stats;
++	NDb::SMapInfo *pMapInfo = nullptr;
++
++protected:
++	static void SetUpTestSuite()
++	{
++		ASSERT_EQ( CastToObjectBaseImpl<CTank>( nullptr, static_cast<void *>( nullptr ) ), nullptr );
++		const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
++		directory = std::filesystem::temp_directory_path() / ( "obk2-net-bot-" + std::to_string( stamp ) );
++		ASSERT_TRUE( std::filesystem::create_directory( directory ) );
++		std::filesystem::copy_file( NET_BOT_TYPES_FILE, directory / "types.xml" );
++		const std::string path = directory.generic_string() + "/";
++		NVFS::SetMainVFS( NVFS::CreateWinVFS( path ) );
++		NVFS::SetMainFileCreator( NVFS::CreateWinFileCreator( path ) );
++		ASSERT_TRUE( NDb::OpenDatabase( NVFS::GetMainVFS(), NVFS::GetMainFileCreator(), NDb::DATABASE_MODE_EDITOR ) );
++	}
++
++	static void TearDownTestSuite()
++	{
++		NDb::CloseDatabase();
++		NVFS::SetMainVFS( nullptr );
++		NVFS::SetMainFileCreator( nullptr );
++		std::error_code error;
++		std::filesystem::remove_all( directory, error );
++	}
++
++	template <class T>
++	T *MakeRecord( const char *type )
++	{
++		CObj<NDb::IObjMan> record = NDb::CreateNewObject( type );
++		static unsigned nextRecord = 0;
++		const std::string name = std::string( type ) + std::to_string( nextRecord++ ) + "netbot.xdb";
++		EXPECT_TRUE( NDb::AddNewObject( name, CDBID( name ), record ) );
++		records.push_back( record );
++		return dynamic_cast<T *>( record->GetObject() );
++	}
++
++	template <class T>
++	T *MakeObject( int type )
++	{
++		T *object = dynamic_cast<T *>( NObjectFactory::MakeObject( type ) );
++		EXPECT_NE( object, nullptr );
++		if ( object )
++		{
++			objects.push_back( object );
++			external.emplace_back( int( external.size() + 1 ), object );
++		}
++		return object;
++	}
++
++	void LoadFields( CObjectBase *object, const std::function<void( IBinSaver & )> &visit )
++	{
++		CMemoryStream stream;
++		{
++			CPtr<IBinSaver> saver = CreateBinSaver( &stream, SAVER_MODE_WRITE, external );
++			SFields fields{ visit };
++			saver->Add( 1, &fields );
++		}
++		stream.Seek( 0 );
++		CPtr<IBinSaver> loader = CreateBinSaver( &stream, SAVER_MODE_READ, external );
++		loader->AddPolymorphicBase( 1, object );
++	}
++
++	// nUniqueID is kept low: the shared command queues start with room for ten units,
++	// and only the real unit creation code grows them.
++	CAIUnit *MakeTank( uint8_t player, const int nUniqueID )
++	{
++		CAIUnit *unit = MakeObject<CAIUnit>( AI_TANK );
++		CVec3 position( 160, 160, 0 );
++		SVector tile( int( position.x / SConsts::TILE_SIZE ), int( position.y / SConsts::TILE_SIZE ) );
++		SAIAngle direction( 0 );
++		bool idle = true;
++		float hp = 100;
++		CPtr<NDb::SUnitStatsModifier> modifierPointer = modifier.GetPtr();
++		std::vector<int> visibility{ 1, 1, 0 };
++		CPtr<CUnitGuns> unitGuns = MakeObject<CUnitGuns>( 0x1108D4C7 );
++		CPtr<IUnitState> rest = MakeObject<IUnitState>( 0x1508D494 );
++		CPtr<CAIUnit> restOwner = unit;
++		LoadFields( rest, [&]( IBinSaver &saver ) { saver.Add( 2, &restOwner ); } );
++		SFields path{ [&]( IBinSaver &saver )
++		              {
++										saver.Add( 3, &direction );
++										saver.Add( 4, &direction );
++										saver.Add( 9, &position );
++										saver.Add( 10, &tile );
++										saver.Add( 16, &idle );
++									} };
++		SFields queue{ [&]( IBinSaver &saver ) { saver.Add( 2, &rest ); } };
++		SFields common{ [&]( IBinSaver &saver )
++		                {
++											saver.Add( 3, &queue );
++											saver.Add( 20, &path );
++										} };
++		SFields ai{ [&]( IBinSaver &saver )
++		            {
++									saver.Add( 1, &common );
++									saver.Add( 6, &player );
++									saver.Add( 15, &hp );
++									saver.Add( 51, &visibility );
++									saver.Add( 58, &modifierPointer );
++								} };
++		SFields mechanical{ [&]( IBinSaver &saver )
++		                    {
++													saver.Add( 1, &ai );
++													saver.Add( 2, &stats );
++													saver.Add( 3, &unitGuns );
++												} };
++		LoadFields( unit, [&]( IBinSaver &saver ) { saver.Add( 1, &mechanical ); } );
++		unit->nUniqueID = nUniqueID;
++		unit->Mem2UniqueIdObjs();
++		return unit;
++	}
++
++	void PlaceKeyBuilding( int nOwner )
++	{
++		CBuildingSimple *building = MakeObject<CBuildingSimple>( 0x1108D450 );
++		CVec3 center( KEY_POINT.x, KEY_POINT.y, 0 );
++		SFields passability{ [&]( IBinSaver &saver ) { saver.Add( 2, &center ); } };
++		int nLinkID = KEY_POINT_LINK;
++		SFields base{ [&]( IBinSaver &saver )
++		              {
++										saver.Add( 1, &passability );
++										saver.Add( 28, &nLinkID );
++									} };
++		LoadFields( building,
++		            [&]( IBinSaver &saver )
++		            {
++									saver.Add( 1, &base );
++									saver.Add( 2, &nOwner );
++								} );
++		building->SetLink( KEY_POINT_LINK );
++
++		NDb::SPlayerBonusData bonus;
++		bonus.nLinkID = KEY_POINT_LINK;
++		pMapInfo->playerBonusObjects.push_back( bonus );
++		theBonusSystem.InitBonusSystem( pMapInfo );
++	}
++
++	void SetUp() override
++	{
++		NSingleton::RegisterSingleton( MakeObject<IAILogic>( 0x1108D441 ), IAILogic::tidTypeID );
++		NSingleton::RegisterSingleton( new CCommonPathFinder(), CCommonPathFinder::tidTypeID );
++		map = new CAIMap( 256, 256, 32, 2, 16 );
++		SetAIMap( map );
++		units.Init();
++		theGroupLogic.Init( nullptr );
++		theDipl.SetNPlayers( N_PLAYERS );
++		theDipl.SetNetGame( true );
++		theDipl.SetParty( PLAYER_ENEMY, 0 );
++		theDipl.SetParty( PLAYER_BOT, 1 );
++		theDipl.SetParty( PLAYER_ALLY, 1 );
++		theDipl.SetParty( PLAYER_SECOND_BOT, 1 );
++		theDipl.SetPlayerBot( PLAYER_BOT, true );
++		theDipl.SetPlayerBot( PLAYER_SECOND_BOT, true );
++		theDipl.SetMyNumber( GetParam() );
++		theReinfArray.resize( N_PLAYERS + 1 );
++		curTime = 100000;
++		SConsts::GENERAL_CELL_SIZE = 256; // normally set when the game consts load
++
++		modifier = new NDb::SUnitStatsModifier;
++		external.emplace_back( 1000, modifier );
++		auto *unitStats = MakeRecord<NDb::SMechUnitRPGStats>( "MechUnitRPGStats" );
++		ASSERT_NE( unitStats, nullptr );
++		unitStats->etype = NDb::RPG_TYPE_ARM_MEDIUM;
++		unitStats->fSight = 1;
++		unitStats->fSpeed = 10;
++		unitStats->fRotateSpeed = 1;
++		unitStats->fMaxHP = 100;
++		unitStats->fPrice = 100;
++		unitStats->vAABBHalfSize = CVec2( 4, 8 );
++		auto *actions = MakeRecord<NDb::SUnitActions>( "UnitActions" );
++		actions->availCommands.SetData( ACTION_COMMAND_SWARM_TO );
++		unitStats->pActions = actions;
++		stats = unitStats;
++
++		// The general weighs every unit it receives against these tables
++		auto *consts = MakeRecord<NDb::SAIGameConsts>( "AIGameConsts" );
++		ASSERT_NE( consts, nullptr );
++		consts->reinfExpediency.resize( NDb::_RT_NONE );
++		NReinforcement::InitReinforcementTypes( consts );
++
++		pMapInfo = MakeRecord<NDb::SMapInfo>( "MapInfo" );
++		ASSERT_NE( pMapInfo, nullptr );
++		pMapInfo->players.resize( N_PLAYERS );
++	}
++
++	void TearDown() override
++	{
++		theSupremeBeing.Clear();
++		theGroupLogic.Clear();
++		theBonusSystem.Clear();
++		theReinfArray.clear();
++		units.Clear();
++		CLinkObject::Clear();
++		theDipl.SetPlayerBot( PLAYER_BOT, false );
++		theDipl.SetPlayerBot( PLAYER_SECOND_BOT, false );
++		theDipl.SetNetGame( false );
++		NSingleton::UnRegisterSingleton( IAILogic::tidTypeID );
++		objects.clear();
++		SetAIMap( nullptr );
++		NSingleton::UnRegisterSingleton( CCommonPathFinder::tidTypeID );
++	}
++
++	void StartGenerals( const std::list<CCommonUnit *> &startUnits )
++	{
++		theSupremeBeing.Init( pMapInfo );
++		theSupremeBeing.GiveNewUnitsToGenerals( startUnits );
++	}
++
++	// Two general ticks: the first hands out the units, the second gives orders.
++	void RunGenerals()
++	{
++		for ( int i = 0; i < 2; ++i )
++		{
++			curTime += 20000;
++			theSupremeBeing.Segment();
++		}
++	}
++
++	static bool IsOrderedToKeyPoint( CCommonUnit *pUnit )
++	{
++		const CAICommand *pCommand = pUnit->GetCurCmd() ? pUnit->GetCurCmd() : pUnit->GetNextCommand();
++		return pCommand && const_cast<CAICommand *>( pCommand )->ToUnitCmd().nCmdType == ACTION_COMMAND_SWARM_TO &&
++		       fabs( const_cast<CAICommand *>( pCommand )->ToUnitCmd().vPos - KEY_POINT ) < 1.0f;
++	}
++};
++
++TEST_P( NetBotGeneral, OnlyBotsGetGenerals )
++{
++	StartGenerals( {} );
++	EXPECT_FALSE( theSupremeBeing.HasGeneralForPlayer( PLAYER_ENEMY ) );
++	EXPECT_TRUE( theSupremeBeing.HasGeneralForPlayer( PLAYER_BOT ) );
++	EXPECT_FALSE( theSupremeBeing.HasGeneralForPlayer( PLAYER_ALLY ) );
++	EXPECT_TRUE( theSupremeBeing.HasGeneralForPlayer( PLAYER_SECOND_BOT ) );
++	EXPECT_FALSE( theSupremeBeing.HasGeneralInParty( 0 ) );
++	EXPECT_TRUE( theSupremeBeing.HasGeneralInParty( 1 ) );
++}
++
++TEST_P( NetBotGeneral, BotSendsItsOwnUnitsToTheEnemyKeyPointAndLeavesItsAllysAlone )
++{
++	CAIUnit *botTank = MakeTank( PLAYER_BOT, 1 );
++	CAIUnit *secondBotTank = MakeTank( PLAYER_SECOND_BOT, 2 );
++	CAIUnit *allyTank = MakeTank( PLAYER_ALLY, 3 );
++	CAIUnit *enemyTank = MakeTank( PLAYER_ENEMY, 4 );
++	PlaceKeyBuilding( PLAYER_ENEMY );
++
++	StartGenerals( { botTank, secondBotTank, allyTank, enemyTank } );
++	RunGenerals();
++
++	EXPECT_TRUE( IsOrderedToKeyPoint( botTank ) );
++	EXPECT_TRUE( IsOrderedToKeyPoint( secondBotTank ) ) << "bots on one side must not take each other's units";
++	EXPECT_FALSE( IsOrderedToKeyPoint( allyTank ) );
++	EXPECT_FALSE( IsOrderedToKeyPoint( enemyTank ) );
++}
++
++TEST_P( NetBotGeneral, NoGeneralsAndNoOrdersInANetGameWithoutBots )
++{
++	theDipl.SetPlayerBot( PLAYER_BOT, false );
++	theDipl.SetPlayerBot( PLAYER_SECOND_BOT, false );
++	CAIUnit *tank = MakeTank( PLAYER_BOT, 5 );
++	PlaceKeyBuilding( PLAYER_ENEMY );
++
++	StartGenerals( { tank } );
++	RunGenerals();
++
++	EXPECT_FALSE( theSupremeBeing.HasGeneralInParty( 1 ) );
++	EXPECT_FALSE( IsOrderedToKeyPoint( tank ) );
++}
++
++// The local player differs between clients, and the result must not.
++INSTANTIATE_TEST_SUITE_P( EveryLocalPlayer, NetBotGeneral, testing::Range( 0, int( N_PLAYERS ) ) );
++} // namespace
+diff --git a/Versions/Temporary/Engine/Sources/AILogic/test/NetBotObjectives.cpp b/Versions/Temporary/Engine/Sources/AILogic/test/NetBotObjectives.cpp
+new file mode 100644
+index 000000000..1e436b19b
+--- /dev/null
++++ b/Versions/Temporary/Engine/Sources/AILogic/test/NetBotObjectives.cpp
+@@ -0,0 +1,131 @@
++#include "../stdafx.h"
++
++#include "../Diplomacy.h"
++#include "../GeneralBotObjectives.h"
++
++#include <gtest/gtest.h>
++
++using NBotObjectives::AssignTargets;
++using NBotObjectives::FindTarget;
++using NBotObjectives::SWorker;
++
++namespace
++{
++std::vector<SWorker> MakeWorkers( const std::vector<CVec2> &positions )
++{
++	std::vector<SWorker> workers( positions.size() );
++	for ( int i = 0; i < positions.size(); ++i )
++	{
++		workers[i].vPosition = positions[i];
++	}
++	return workers;
++}
++} // namespace
++
++TEST( NetBotObjectives, EachUnitGoesToTheNearestPointWithRoomLeft )
++{
++	const std::vector<CVec2> targets{ CVec2( 0, 0 ), CVec2( 1000, 0 ) };
++	std::vector<SWorker> workers = MakeWorkers( { CVec2( 10, 0 ), CVec2( 990, 0 ) } );
++	AssignTargets( targets, &workers );
++	EXPECT_EQ( workers[0].nTarget, 0 );
++	EXPECT_EQ( workers[1].nTarget, 1 );
++}
++
++TEST( NetBotObjectives, NoPointIsLeftEmptyWhileAnotherHasMoreThanItsShare )
++{
++	const std::vector<CVec2> targets{ CVec2( 0, 0 ), CVec2( 1000, 0 ), CVec2( 5000, 0 ) };
++	// All of them start next to the first point
++	std::vector<SWorker> workers = MakeWorkers( { CVec2( 1, 0 ), CVec2( 2, 0 ), CVec2( 3, 0 ), CVec2( 4, 0 ), CVec2( 5, 0 ), CVec2( 6, 0 ) } );
++	AssignTargets( targets, &workers );
++	std::vector<int> counts( targets.size(), 0 );
++	for ( const SWorker &worker : workers )
++	{
++		ASSERT_GE( worker.nTarget, 0 );
++		++counts[worker.nTarget];
++	}
++	EXPECT_EQ( counts, ( std::vector<int>{ 2, 2, 2 } ) );
++}
++
++TEST( NetBotObjectives, UnitsKeepAValidTargetEvenWhenAnotherIsCloser )
++{
++	const std::vector<CVec2> targets{ CVec2( 0, 0 ), CVec2( 1000, 0 ) };
++	std::vector<SWorker> workers = MakeWorkers( { CVec2( 1, 0 ), CVec2( 1001, 0 ) } );
++	workers[0].nTarget = 1;
++	workers[1].nTarget = 0;
++	AssignTargets( targets, &workers );
++	EXPECT_EQ( workers[0].nTarget, 1 );
++	EXPECT_EQ( workers[1].nTarget, 0 );
++}
++
++TEST( NetBotObjectives, AnOverfilledPointGivesUpItsLastUnits )
++{
++	const std::vector<CVec2> targets{ CVec2( 0, 0 ), CVec2( 1000, 0 ) };
++	std::vector<SWorker> workers = MakeWorkers( { CVec2( 1, 0 ), CVec2( 2, 0 ), CVec2( 3, 0 ), CVec2( 4, 0 ) } );
++	for ( SWorker &worker : workers )
++	{
++		worker.nTarget = 0; // the other point has just been lost
++	}
++	AssignTargets( targets, &workers );
++	EXPECT_EQ( workers[0].nTarget, 0 );
++	EXPECT_EQ( workers[1].nTarget, 0 );
++	EXPECT_EQ( workers[2].nTarget, 1 );
++	EXPECT_EQ( workers[3].nTarget, 1 );
++}
++
++TEST( NetBotObjectives, TiesAlwaysGoToTheLowerIndexSoAllClientsAgree )
++{
++	const std::vector<CVec2> targets{ CVec2( -100, 0 ), CVec2( 100, 0 ) };
++	std::vector<SWorker> first = MakeWorkers( { CVec2( 0, 0 ) } );
++	AssignTargets( targets, &first );
++	EXPECT_EQ( first[0].nTarget, 0 );
++}
++
++TEST( NetBotObjectives, ALostTargetIsNotFound )
++{
++	const std::vector<CVec2> targets{ CVec2( 0, 0 ), CVec2( 1000, 0 ) };
++	EXPECT_EQ( FindTarget( targets, CVec2( 1000, 0 ) ), 1 );
++	EXPECT_EQ( FindTarget( targets, CVec2( 5, 5 ) ), -1 );
++}
++
++TEST( NetBotObjectives, NothingToDoWithoutTargetsOrWorkers )
++{
++	std::vector<SWorker> workers = MakeWorkers( { CVec2( 1, 0 ) } );
++	AssignTargets( {}, &workers );
++	EXPECT_EQ( workers[0].nTarget, -1 );
++	std::vector<SWorker> none;
++	AssignTargets( { CVec2( 0, 0 ) }, &none );
++	EXPECT_TRUE( none.empty() );
++}
++
++// Every client must get the same answer whichever player sits at its keyboard.
++TEST( NetBotDiplomacy, BotsDoNotDependOnTheLocalPlayer )
++{
++	CDiplomacy dipl;
++	dipl.SetNPlayers( 4 );
++	dipl.SetNetGame( true );
++	dipl.SetPlayerBot( 1, true );
++	dipl.SetPlayerBot( 3, true );
++	for ( int nLocal = 0; nLocal < 4; ++nLocal )
++	{
++		dipl.SetMyNumber( nLocal );
++		EXPECT_FALSE( dipl.IsAIPlayer( 0 ) );
++		EXPECT_TRUE( dipl.IsAIPlayer( 1 ) );
++		EXPECT_FALSE( dipl.IsAIPlayer( 2 ) );
++		EXPECT_TRUE( dipl.IsAIPlayer( 3 ) );
++		EXPECT_FALSE( dipl.IsAIPlayer( 4 ) ) << "the neutral player is not a bot";
++	}
++}
++
++TEST( NetBotDiplomacy, WithoutBotsANetGameHasNoAIPlayersAndSinglePlayerIsUnchanged )
++{
++	CDiplomacy dipl;
++	dipl.SetNPlayers( 2 );
++	dipl.SetNetGame( true );
++	EXPECT_FALSE( dipl.IsAIPlayer( 0 ) );
++	EXPECT_FALSE( dipl.IsAIPlayer( 1 ) );
++
++	dipl.SetNetGame( false );
++	dipl.SetMyNumber( 0 );
++	EXPECT_FALSE( dipl.IsAIPlayer( 0 ) );
++	EXPECT_TRUE( dipl.IsAIPlayer( 1 ) );
++}
+diff --git a/Versions/Temporary/Engine/Sources/GameX/CommandsHistory.cpp b/Versions/Temporary/Engine/Sources/GameX/CommandsHistory.cpp
+index 56c402c39..37dd78ad7 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/CommandsHistory.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/CommandsHistory.cpp
+@@ -351,6 +351,7 @@ bool CCommandsHistory::LoadHistory( const std::string &szFileName )
+ 		pScenarioTracker->SetPlayerSide( i, slot.nTeam );
+ 		pScenarioTracker->SetPlayerParty( i, slot.nCountry );
+ 		pScenarioTracker->SetPlayerColour( i, slot.nColour );
++		pScenarioTracker->SetPlayerBot( i, slot.bBot );
+ 
+ 		scenarioInfo.players.push_back( IScenarioTracker::SMultiplayerInfo::SPlayer() );
+ 		IScenarioTracker::SMultiplayerInfo::SPlayer &scenarioPlayer = scenarioInfo.players.back();
+diff --git a/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.cpp b/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.cpp
+index c6170f307..fb81f77df 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.cpp
+@@ -295,12 +295,30 @@ bool CInterfaceMPGameRoom::OnPlayerCombo( const std::string &szSender )
+ 	}
+ 	NI_VERIFY( nIndex >= 0, fmt::format( "Combo change received from unknown control '{}'", szSender ), return true );
+ 	SUISlot &slot = slots[nIndex];
+-	bool bWantClosed = ( slot.pPlayerCombo->GetSelectedIndex() == 1 );
++	const int nSelected = slot.pPlayerCombo->GetSelectedIndex();
++	bool bWantClosed = ( nSelected == 1 );
++	const int nBotTeam = nSelected >= 2 ? nSelected - 2 : -1;
++
++	// Bots don't need asking; only a person being replaced does.
++	if ( slot.info.bBot )
++	{
++		if ( nBotTeam >= 0 )
++		{
++			PutBotInSlot( nIndex, nBotTeam );
++		}
++		else
++		{
++			OpenCloseEmptySlot( nIndex, bWantClosed );
++		}
++		UpdateInterior();
++		return true;
++	}
+ 
+ 	if ( slot.info.bPresent )
+ 	{
+ 		nRequestedSlotChangeIndex = nIndex;
+ 		bRequestedSlotChangeClosed = bWantClosed;
++		nRequestedSlotBotTeam = nBotTeam;
+ 
+ 		// Ask user
+ 		NMainLoop::Command(
+@@ -311,7 +329,12 @@ bool CInterfaceMPGameRoom::OnPlayerCombo( const std::string &szSender )
+ 		return true;
+ 	}
+ 
+-	if ( slot.info.bAccept != bWantClosed )
++	if ( nBotTeam >= 0 )
++	{
++		PutBotInSlot( nIndex, nBotTeam );
++		UpdateInterior();
++	}
++	else if ( slot.info.bAccept != bWantClosed )
+ 	{
+ 		OpenCloseEmptySlot( nIndex, bWantClosed );
+ 	}
+@@ -319,6 +342,36 @@ bool CInterfaceMPGameRoom::OnPlayerCombo( const std::string &szSender )
+ 	return true;
+ }
+ 
++void CInterfaceMPGameRoom::PutBotInSlot( const int nSlot, const int nTeam )
++{
++	// Free colour: the start check refuses two players with the same one
++	int nUsedColours = 0;
++	for ( int i = 0; i < slots.size(); ++i )
++	{
++		if ( i != nSlot && slots[i].info.bPresent )
++		{
++			nUsedColours |= 1UL << slots[i].info.nColour;
++		}
++	}
++	int nColour = 0;
++	while ( nUsedColours & ( 1UL << nColour ) )
++	{
++		++nColour;
++	}
++
++	SMPSlot &info = slots[nSlot].info;
++	info.Clear();
++	info.bPresent = true;
++	info.bBot = true;
++	info.bAccept = true; // always ready
++	info.nTeam = nTeam;
++	info.nColour = nColour;
++	info.szName = fmt::format( "Bot {}", nSlot + 1 );
++	info.bRandomCountry = true; // SendUpdateSlot picks one the tech level allows
++	SendUpdateSlot( nSlot );
++	CheckStartConditions();
++}
++
+ bool CInterfaceMPGameRoom::OnChangeSideReaction()
+ {
+ 	// Invoked when OWN slot changes
+@@ -707,6 +760,10 @@ bool CInterfaceMPGameRoom::OnGameRoomInitMessage( const SMPUIGameRoomInitMessage
+ 				slot.pPlayerCombo->SetViewer( new CTextDataViewer() );
+ 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_OPEN" ) ) );
+ 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_CLOSE" ) ) );
++				// Written out rather than taken from the UI text tables, which belong to the installed
++				// game's data. Latin letters because every localization's fonts have them.
++				slot.pPlayerCombo->AddItem( new CTextData( L"Bot - Team 1" ) );
++				slot.pPlayerCombo->AddItem( new CTextData( L"Bot - Team 2" ) );
+ 				slot.pPlayerCombo->Select( 0 );
+ 				slot.pPlayerCombo->Enable( true );
+ 			}
+@@ -934,9 +991,17 @@ void CInterfaceMPGameRoom::OpenCloseEmptySlot( const int nSlot, const bool bClos
+ 
+ void CInterfaceMPGameRoom::MsgOk( const SGameMessage &msg )
+ {
+-	// Kick
+-	OpenCloseEmptySlot( nRequestedSlotChangeIndex, bRequestedSlotChangeClosed );
++	// Kick, or put a bot in the player's place
++	if ( nRequestedSlotBotTeam >= 0 )
++	{
++		PutBotInSlot( nRequestedSlotChangeIndex, nRequestedSlotBotTeam );
++	}
++	else
++	{
++		OpenCloseEmptySlot( nRequestedSlotChangeIndex, bRequestedSlotChangeClosed );
++	}
+ 
++	nRequestedSlotBotTeam = -1;
+ 	nRequestedSlotChangeIndex = -1;
+ 	UpdateInterior();
+ }
+diff --git a/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.h b/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.h
+index fefb3924b..65ea11835 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.h
++++ b/Versions/Temporary/Engine/Sources/GameX/InterfaceMPGameRoom.h
+@@ -60,6 +60,7 @@ class CInterfaceMPGameRoom : public CInterfaceMPScreenBase, public IProgrammedRe
+ 	bool bHost;
+ 	int nRequestedSlotChangeIndex;
+ 	bool bRequestedSlotChangeClosed;
++	int nRequestedSlotBotTeam = -1; // team of the bot that replaces the kicked player, -1 for none
+ 	CPtr<IWindow> pAdvancedPopup;
+ 	CPtr<ITextView> pCantStartAccept;
+ 	CPtr<ITextView> pCantStartSide;
+@@ -103,6 +104,7 @@ private:
+ 	void CheckStartConditions();
+ 	void ReturnToGamesList();
+ 	void OpenCloseEmptySlot( const int nSlot, const bool bClosed );
++	void PutBotInSlot( const int nSlot, const int nTeam );
+ 
+ 	void SendUpdateSlot( const int nSlot );
+ 
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPInterfaceData.h b/Versions/Temporary/Engine/Sources/GameX/MPInterfaceData.h
+index a7d8082b1..f6baa7d9f 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPInterfaceData.h
++++ b/Versions/Temporary/Engine/Sources/GameX/MPInterfaceData.h
+@@ -21,6 +21,7 @@ struct SMPSlot
+ 	bool bRandomCountry = {};
+ 	int nPing = {}; // -1 means no data
+ 	uint16_t wConnectedTo = {};
++	bool bBot = {}; // played by the AI general on every client; has no client of its own
+ 
+ 	ZEND int operator&( IBinSaver &f )
+ 	{
+@@ -34,6 +35,7 @@ struct SMPSlot
+ 		f.Add( 9, &bRandomCountry );
+ 		f.Add( 10, &nPing );
+ 		f.Add( 11, &wConnectedTo );
++		f.Add( 12, &bBot );
+ 		return 0;
+ 	}
+ 
+@@ -63,6 +65,7 @@ struct SMPSlot
+ 		bAccept = false;
+ 		nPing = -1;
+ 		wConnectedTo = 0;
++		bBot = false;
+ 	}
+ 
+ 	SMPSlot &operator=( const SMPSlot &src )
+@@ -77,6 +80,7 @@ struct SMPSlot
+ 		bAccept = src.bAccept;
+ 		nPing = src.nPing;
+ 		wConnectedTo = src.wConnectedTo;
++		bBot = src.bBot;
+ 		return *this;
+ 	}
+ };
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerMode.h b/Versions/Temporary/Engine/Sources/GameX/MPManagerMode.h
+index 4df3fd96e..34dc0b5bd 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerMode.h
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerMode.h
+@@ -174,6 +174,8 @@ private:
+ 	bool OnB2UserPausePacket( class CB2UserPausePacket *pPacket );
+ 	bool OnB2DropPlayerAtSegmentPacket( class CB2DropPlayerAtSegmentPacket *pPacket );
+ 	bool OnB2GameLostPacket( class CB2GameLostPacket *pPacket );
++	bool IsTeamOnlyBots( int nTeam ) const;
++	void ScheduleBotTeamLoss( int nTeam );
+ 	bool OnPingPacket( class CPingPacket *pPacket );
+ 	//}
+ 
+@@ -299,20 +301,25 @@ public:
+ 	ZDATA
+ 	int nGameID;
+ 	int nSegment;
++	int nBotTeam = -1;
+ 
+ 	ZEND int operator&( IBinSaver &f ) override
+ 	{
+ 		f.Add( 2, &nGameID );
+ 		f.Add( 3, &nSegment );
++		f.Add( 4, &nBotTeam );
+ 		return 0;
+ 	}
+ 
+ 	CB2GameLostPacket() {}
+ 
+-	CB2GameLostPacket( const int nClientID, const int _nGameID, const int _nSegment )
++	// _nBotTeam is the team of bots that lost, when the host announces it for them.
++	// -1 means the sender's own team lost.
++	CB2GameLostPacket( const int nClientID, const int _nGameID, const int _nSegment, const int _nBotTeam = -1 )
+ 		: CNetPacket( nClientID )
+ 		, nGameID( _nGameID )
+ 		, nSegment( _nSegment )
++		, nBotTeam( _nBotTeam )
+ 	{
+ 	}
+ };
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeClients.cpp b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeClients.cpp
+index 00fd29983..5804bfbc8 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeClients.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeClients.cpp
+@@ -52,10 +52,10 @@ bool CMPManagerMode::HostAssignNewClient( int nClientID )
+ 			pGameInfoPkt->info = gameDesc;
+ 			pClient->SendGamePacket( pGameInfoPkt, false );
+ 
+-			// Send closed slots
++			// Send closed slots, and bots, which have no client to introduce them
+ 			for ( int nSlot = 0; nSlot < slots.size(); ++nSlot )
+ 			{
+-				if ( !slots[nSlot].bPresent && slots[nSlot].bAccept )
++				if ( ( !slots[nSlot].bPresent && slots[nSlot].bAccept ) || slots[nSlot].bBot )
+ 				{
+ 					pClient->SendGamePacket( new CB2SlotInfoPacket( nClientID, nSlot, slots[nSlot] ), false );
+ 				}
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeGameControl.cpp b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeGameControl.cpp
+index 4e554b7bf..414f45aba 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeGameControl.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeGameControl.cpp
+@@ -33,7 +33,16 @@ void CMPManagerMode::StartGame()
+ 	// Do all initialising
+ 	SB2StartGameParams tranParams;
+ 	tranParams.pMapInfo = gameDesc.pMPMap->pMap;
+-	tranParams.clients.resize( nSlotsUsed );
++	// Bots hold slots but send nothing, so lockstep must not wait for them.
++	int nClients = 0;
++	for ( int i = 0; i < slots.size(); ++i )
++	{
++		if ( IsPlayerPresent( i ) && !slots[i].bBot )
++		{
++			++nClients;
++		}
++	}
++	tranParams.clients.resize( nClients );
+ 	tranParams.nSpeedAdjustment = gameDesc.nGameSpeed;
+ 
+ 	// Scenario tracker
+@@ -82,6 +91,7 @@ void CMPManagerMode::StartGame()
+ 		pScenarioTracker->SetPlayerSide( i, slot.nTeam );
+ 		pScenarioTracker->SetPlayerParty( i, slot.nCountry );
+ 		pScenarioTracker->SetPlayerColour( i, slot.nColour );
++		pScenarioTracker->SetPlayerBot( i, slot.bBot );
+ 
+ 		IScenarioTracker::SMultiplayerInfo::SPlayer &scenarioPlayer = scenarioInfo.players.emplace_back();
+ 		scenarioPlayer.wszName = NStr::ToUnicode( slot.szName );
+@@ -91,18 +101,18 @@ void CMPManagerMode::StartGame()
+ 		scenarioPlayer.nLevel = 1;
+ 		scenarioPlayer.wszRank = L"";
+ 
+-		if ( nTranSlot < tranParams.clients.size() )
++		if ( !slot.bBot && nTranSlot < tranParams.clients.size() )
+ 		{
+ 			tranParams.clients[nTranSlot].nClientID = slot.nClientID;
+ 			tranParams.clients[nTranSlot].nPlayer = i;
+ 			tranParams.clients[nTranSlot].nTeam = slot.nTeam;
+ 			++nTranSlot;
+ 		}
+-		NI_ASSERT( nTranSlot <= nSlotsUsed, "PRG: Incorrectly counted used slots." );
++		NI_ASSERT( nTranSlot <= nClients, "PRG: Incorrectly counted used slots." );
+ 	}
+ 	pScenarioTracker->SetMultiplayerInfo( scenarioInfo );
+-	NI_ASSERT( nTranSlot == nSlotsUsed,
+-	           fmt::format( "PRG: Incorrectly counted used slots - {}/{}.", nTranSlot, nSlotsUsed ) );
++	NI_ASSERT( nTranSlot == nClients,
++	           fmt::format( "PRG: Incorrectly counted used slots - {}/{}.", nTranSlot, nClients ) );
+ 	pScenarioTracker->SetLocalPlayer( nOwnSlot );
+ 
+ 	NGlobal::SetVar( "multiplayer_time_limit", -1 );
+@@ -205,6 +215,39 @@ void CMPManagerMode::ScheduleWinGame()
+ 	bOutcomeKnown = true;
+ }
+ 
++bool CMPManagerMode::IsTeamOnlyBots( const int nTeam ) const
++{
++	bool bHasBots = false;
++	for ( int i = 0; i < slots.size(); ++i )
++	{
++		if ( slots[i].bPresent && slots[i].nTeam == nTeam )
++		{
++			if ( !slots[i].bBot )
++			{
++				return false;
++			}
++			bHasBots = true;
++		}
++	}
++	return bHasBots;
++}
++
++void CMPManagerMode::ScheduleBotTeamLoss( const int nTeam )
++{
++	// Normally the losers announce their own defeat, but bots have no client to do it.
++	// The game control host speaks for them, so all clients end on the same segment.
++	if ( bOutcomeKnown || !IsValid( pTransceiver ) || !IsGameControlHost() )
++	{
++		return;
++	}
++	const int nSegment = pTransceiver->ScheduleGameEnd( -1 );
++	NGameX::MatchPacketTrace_Log(
++			nSegment, "TX", "CB2GameLostPacket", GetOwnClientID(), fmt::format( "game_id={} bot_team={}", nGameID, nTeam ) );
++	BroadcastGameControlPacket( new CB2GameLostPacket( 0, nGameID, nSegment, nTeam ) );
++	bWinOnGameEnd = slots[nOwnSlot].nTeam != nTeam;
++	bOutcomeKnown = true;
++}
++
+ void CMPManagerMode::ScheduleLoseGame()
+ {
+ 	NGameX::MatchPacketTrace_Log( IsValid( pTransceiver ) ? pTransceiver->GetCurrentCommonSegment() : -1,
+@@ -406,6 +449,11 @@ bool CMPManagerMode::CheckScoreWinLose()
+ 			ScheduleLoseGame();
+ 			return true;
+ 		}
++		if ( IsTeamOnlyBots( nLostTeam ) )
++		{
++			ScheduleBotTeamLoss( nLostTeam );
++			return bOutcomeKnown;
++		}
+ 	}
+ 	return false;
+ }
+@@ -474,6 +522,14 @@ bool CMPManagerMode::CheckKeyBuildingsWinLose()
+ 					ScheduleLoseGame();
+ 					return true;
+ 				}
++				if ( IsTeamOnlyBots( 1 - nWinningSide ) )
++				{
++					ScheduleBotTeamLoss( 1 - nWinningSide );
++					if ( bOutcomeKnown )
++					{
++						return true;
++					}
++				}
+ 			}
+ 		}
+ 	}
+@@ -512,6 +568,27 @@ bool CMPManagerMode::CheckInstantLose()
+ 			ScheduleLoseGame();
+ 			return true;
+ 		}
++
++		// The same rule for a team of bots: no key points and no units left
++		const int nLosingTeam = 1 - nWinningSide;
++		if ( ( nWinningSide == 0 || nWinningSide == 1 ) && IsTeamOnlyBots( nLosingTeam ) )
++		{
++			bool bAnyUnits = false;
++			for ( int i = 0; i < slots.size(); ++i )
++			{
++				if ( IsPlayerPresent( i ) && slots[i].nTeam == nLosingTeam &&
++				     !Singleton<IAILogic>()->HasPlayerNoUnits( i ) )
++				{
++					bAnyUnits = true;
++					break;
++				}
++			}
++			if ( !bAnyUnits )
++			{
++				ScheduleBotTeamLoss( nLosingTeam );
++				return bOutcomeKnown;
++			}
++		}
+ 	}
+ 	return false;
+ }
+@@ -545,7 +622,8 @@ void CMPManagerMode::AnalyzeLaggers()
+ 	uint32_t dwPlayers = 0;
+ 	for ( int i = 0; i < slots.size(); ++i )
+ 	{
+-		if ( IsPlayerPresent( i ) )
++		// Bots can't vote to kick a lagging player, so they must not be waited on to reach a majority.
++		if ( IsPlayerPresent( i ) && !slots[i].bBot )
+ 		{
+ 			dwPlayers |= ( 1UL << i );
+ 		}
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeMessages.cpp b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeMessages.cpp
+index c40121e10..5e6b68afb 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeMessages.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeMessages.cpp
+@@ -162,16 +162,39 @@ bool CMPManagerMode::OnUpdateSlotMessage( SMPUIUpdateSlotMessage *pMsg )
+ 		// Process slot open/close
+ 		if ( IsGameHost() && newSlot.bPresent == false )
+ 		{
+-			if ( oldSlot.bPresent ) // Kick player
++			if ( oldSlot.bBot ) // Bot removed: there is no client to kick
++			{
++				--nSlotsUsed;
++			}
++			else if ( oldSlot.bPresent ) // Kick player
+ 			{
+ 				KickPlayerFromSlot( pMsg->nSlot );
+ 				RemoveClient( oldSlot.nClientID, true );
+ 				--nSlotsUsed;
+ 			}
+ 		}
++		else if ( IsGameHost() && newSlot.bBot && !oldSlot.bBot )
++		{
++			// Bot added. A person's slot is counted in the new client handler, a bot has none.
++			if ( oldSlot.bPresent )
++			{
++				KickPlayerFromSlot( pMsg->nSlot );
++				RemoveClient( oldSlot.nClientID, true ); // also counts the slot as free
++				// RemoveClient told the UI the slot is empty; it holds the bot from here on.
++				SMPUIUpdateSlotMessage *pUpdateMsg = new SMPUIUpdateSlotMessage;
++				pUpdateMsg->nSlot = pMsg->nSlot;
++				pUpdateMsg->info = newSlot;
++				PushMessage( pUpdateMsg );
++			}
++			++nSlotsUsed;
++		}
+ 		uint16_t wOldConnectMask = oldSlot.wConnectedTo;
+ 		oldSlot = newSlot;
+ 		oldSlot.wConnectedTo = wOldConnectMask;
++		if ( newSlot.bBot )
++		{
++			oldSlot.nClientID = -1;
++		}
+ 		pClient->SendGamePacket( new CB2SlotInfoPacket( 0, pMsg->nSlot, newSlot ), true );
+ 	}
+ 	else
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeNivalNet.cpp b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeNivalNet.cpp
+index 5dd9be62c..9dcdb1102 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerModeNivalNet.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerModeNivalNet.cpp
+@@ -506,7 +506,7 @@ void CMPManagerModeNivalNet::ProcessLadderWaitForClients()
+ 		SMPSlot &slot = slots[i];
+ 		if ( slot.bPresent )
+ 		{
+-			if ( slot.bAccept && slot.wConnectedTo == slots[nOwnSlot].wConnectedTo )
++			if ( slot.bBot || ( slot.bAccept && slot.wConnectedTo == slots[nOwnSlot].wConnectedTo ) )
+ 			{
+ 				++nClientsConnected;
+ 			}
+diff --git a/Versions/Temporary/Engine/Sources/GameX/MPManagerModePackets.cpp b/Versions/Temporary/Engine/Sources/GameX/MPManagerModePackets.cpp
+index 3086a4a19..377d17b16 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/MPManagerModePackets.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/MPManagerModePackets.cpp
+@@ -36,7 +36,10 @@ bool CMPManagerMode::OnB2SlotInfoPacket( class CB2SlotInfoPacket *pPacket )
+ 	{
+ 		if ( nOwnSlot >= 0 )
+ 		{
+-			pClient->SendGamePacket( new CPingPacket( pPacket->nClientID, nOwnSlot, GameTimer()->GetAbsTime() ), false );
++			if ( !pPacket->info.bBot )
++			{
++				pClient->SendGamePacket( new CPingPacket( pPacket->nClientID, nOwnSlot, GameTimer()->GetAbsTime() ), false );
++			}
+ 		}
+ 		// Only clients increase slot counter here, server increases it in NEW_CLIENT handler
+ 		if ( !IsGameHost() )
+@@ -52,7 +55,8 @@ bool CMPManagerMode::OnB2SlotInfoPacket( class CB2SlotInfoPacket *pPacket )
+ 	SMPSlot &slot = slots[pPacket->nSlot];
+ 	int nStoredPing = slot.nPing;
+ 	slot = pPacket->info;
+-	slot.nClientID = pPacket->nClientID;
++	// A bot's slot arrives from the host, but the slot must not become the host's.
++	slot.nClientID = pPacket->info.bBot ? -1 : pPacket->nClientID;
+ 	slot.nPing = nStoredPing;
+ 
+ 	if ( nOwnSlot >= 0 )
+@@ -424,6 +428,18 @@ bool CMPManagerMode::OnB2GameLostPacket( class CB2GameLostPacket *pPacket )
+ 	                              pPacket->nClientID,
+ 	                              fmt::format( "game_id={} segment={}", pPacket->nGameID, pPacket->nSegment ) );
+ 
++	if ( pPacket->nBotTeam >= 0 )
++	{
++		const bool bPacketWinsGame = slots[nOwnSlot].nTeam != pPacket->nBotTeam;
++		if ( !bOutcomeKnown || bWinOnGameEnd == bPacketWinsGame )
++		{
++			pTransceiver->ScheduleGameEnd( pPacket->nSegment );
++			bOutcomeKnown = true;
++			bWinOnGameEnd = bPacketWinsGame;
++		}
++		return true;
++	}
++
+ 	//DebugTrace( "+++ GameLost packet" );
+ 	for ( int i = 0; i < slots.size(); ++i )
+ 	{
+diff --git a/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.h b/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.h
+index 82ecd14b0..6bec90e28 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.h
++++ b/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.h
+@@ -416,6 +416,7 @@ struct IScenarioTracker : public IAIScenarioTracker
+ 	virtual void SetPlayerParty( const int nPlayer, const int nNewSide ) = 0;
+ 	virtual void SetPlayerSide( const int nPlayer, const int nNewTeam ) = 0;
+ 	virtual void SetPlayerColour( const int nPlayer, const int nNewColour ) = 0;
++	virtual void SetPlayerBot( const int nPlayer, const bool bBot ) {}
+ 
+ 	// Leaders (commanders)
+ 	virtual const SLeaderInfo *GetLeaderInfo( const NDb::EReinforcementType eReinf ) const = 0;
+diff --git a/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.hpp b/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.hpp
+index 26ca8023d..22af482a2 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.hpp
++++ b/Versions/Temporary/Engine/Sources/GameX/ScenarioTracker.hpp
+@@ -488,6 +488,7 @@ class CScenarioTrackerMultiplayer : public IScenarioTracker
+ 				ZSKIP //CDBPtr<NDb::SBackground> pUnitFullInfoColor;
+ 						SPlayerColor playerColor;
+ 		int nReinforcementCallsUsed = {};
++		bool bBot = {};
+ 
+ 		ZEND int operator&( IBinSaver &f )
+ 		{
+@@ -502,6 +503,7 @@ class CScenarioTrackerMultiplayer : public IScenarioTracker
+ 			f.Add( 11, &leaderLevels );
+ 			f.Add( 14, &playerColor );
+ 			f.Add( 15, &nReinforcementCallsUsed );
++			f.Add( 16, &bBot );
+ 			return 0;
+ 		}
+ 
+@@ -884,6 +886,8 @@ public:
+ 	void SetPlayerSide( const int nPlayer, const int nNewTeam ) override;
+ 	const NDb::SReinforcement *GetStartUnits( int nPlayer ) const override;
+ 	void SetPlayerColour( const int nPlayer, const int nNewColour ) override;
++	void SetPlayerBot( const int nPlayer, const bool bBot ) override;
++	bool IsPlayerBot( const int nPlayer ) const override;
+ 
+ 	// Leaders (commanders)
+ 	const SLeaderInfo *GetLeaderInfo( const NDb::EReinforcementType eReinf ) const override;
+diff --git a/Versions/Temporary/Engine/Sources/GameX/ScenarioTrackerMP.cpp b/Versions/Temporary/Engine/Sources/GameX/ScenarioTrackerMP.cpp
+index 1c473aab4..b49efa117 100644
+--- a/Versions/Temporary/Engine/Sources/GameX/ScenarioTrackerMP.cpp
++++ b/Versions/Temporary/Engine/Sources/GameX/ScenarioTrackerMP.cpp
+@@ -322,6 +322,19 @@ void CScenarioTrackerMultiplayer::RemovePlayer( const int nPlayer )
+ 	}
+ }
+ 
++void CScenarioTrackerMultiplayer::SetPlayerBot( const int nPlayer, const bool bBot )
++{
++	if ( nPlayer >= 0 && nPlayer < players.size() )
++	{
++		players[nPlayer].bBot = bBot;
++	}
++}
++
++bool CScenarioTrackerMultiplayer::IsPlayerBot( const int nPlayer ) const
++{
++	return nPlayer >= 0 && nPlayer < players.size() && players[nPlayer].bBot;
++}
++
+ bool CScenarioTrackerMultiplayer::IsPlayerPresent( const int nPlayer ) const
+ {
+ 	if ( nPlayer >= 0 && nPlayer < players.size() )
