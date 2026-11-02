@@ -322,6 +322,19 @@ void CScenarioTrackerMultiplayer::RemovePlayer( const int nPlayer )
 	}
 }
 
+void CScenarioTrackerMultiplayer::SetPlayerBot( const int nPlayer, const bool bBot )
+{
+	if ( nPlayer >= 0 && nPlayer < players.size() )
+	{
+		players[nPlayer].bBot = bBot;
+	}
+}
+
+bool CScenarioTrackerMultiplayer::IsPlayerBot( const int nPlayer ) const
+{
+	return nPlayer >= 0 && nPlayer < players.size() && players[nPlayer].bBot;
+}
+
 bool CScenarioTrackerMultiplayer::IsPlayerPresent( const int nPlayer ) const
 {
 	if ( nPlayer >= 0 && nPlayer < players.size() )

@@ -295,12 +295,30 @@ bool CInterfaceMPGameRoom::OnPlayerCombo( const std::string &szSender )
 	}
 	NI_VERIFY( nIndex >= 0, fmt::format( "Combo change received from unknown control '{}'", szSender ), return true );
 	SUISlot &slot = slots[nIndex];
-	bool bWantClosed = ( slot.pPlayerCombo->GetSelectedIndex() == 1 );
+	const int nSelected = slot.pPlayerCombo->GetSelectedIndex();
+	bool bWantClosed = ( nSelected == 1 );
+	const int nBotTeam = nSelected >= 2 ? nSelected - 2 : -1;
+
+	// Bots don't need asking; only a person being replaced does.
+	if ( slot.info.bBot )
+	{
+		if ( nBotTeam >= 0 )
+		{
+			PutBotInSlot( nIndex, nBotTeam );
+		}
+		else
+		{
+			OpenCloseEmptySlot( nIndex, bWantClosed );
+		}
+		UpdateInterior();
+		return true;
+	}
 
 	if ( slot.info.bPresent )
 	{
 		nRequestedSlotChangeIndex = nIndex;
 		bRequestedSlotChangeClosed = bWantClosed;
+		nRequestedSlotBotTeam = nBotTeam;
 
 		// Ask user
 		NMainLoop::Command(
@@ -311,12 +329,47 @@ bool CInterfaceMPGameRoom::OnPlayerCombo( const std::string &szSender )
 		return true;
 	}
 
-	if ( slot.info.bAccept != bWantClosed )
+	if ( nBotTeam >= 0 )
+	{
+		PutBotInSlot( nIndex, nBotTeam );
+		UpdateInterior();
+	}
+	else if ( slot.info.bAccept != bWantClosed )
 	{
 		OpenCloseEmptySlot( nIndex, bWantClosed );
 	}
 
 	return true;
+}
+
+void CInterfaceMPGameRoom::PutBotInSlot( const int nSlot, const int nTeam )
+{
+	// Free colour: the start check refuses two players with the same one
+	int nUsedColours = 0;
+	for ( int i = 0; i < slots.size(); ++i )
+	{
+		if ( i != nSlot && slots[i].info.bPresent )
+		{
+			nUsedColours |= 1UL << slots[i].info.nColour;
+		}
+	}
+	int nColour = 0;
+	while ( nUsedColours & ( 1UL << nColour ) )
+	{
+		++nColour;
+	}
+
+	SMPSlot &info = slots[nSlot].info;
+	info.Clear();
+	info.bPresent = true;
+	info.bBot = true;
+	info.bAccept = true; // always ready
+	info.nTeam = nTeam;
+	info.nColour = nColour;
+	info.szName = fmt::format( "Bot {}", nSlot + 1 );
+	info.bRandomCountry = true; // SendUpdateSlot picks one the tech level allows
+	SendUpdateSlot( nSlot );
+	CheckStartConditions();
 }
 
 bool CInterfaceMPGameRoom::OnChangeSideReaction()
@@ -707,6 +760,10 @@ bool CInterfaceMPGameRoom::OnGameRoomInitMessage( const SMPUIGameRoomInitMessage
 				slot.pPlayerCombo->SetViewer( new CTextDataViewer() );
 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_OPEN" ) ) );
 				slot.pPlayerCombo->AddItem( new CTextData( pScreen->GetTextEntry( "COMBO_CLOSE" ) ) );
+				// Written out rather than taken from the UI text tables, which belong to the installed
+				// game's data. Latin letters because every localization's fonts have them.
+				slot.pPlayerCombo->AddItem( new CTextData( L"Bot - Team 1" ) );
+				slot.pPlayerCombo->AddItem( new CTextData( L"Bot - Team 2" ) );
 				slot.pPlayerCombo->Select( 0 );
 				slot.pPlayerCombo->Enable( true );
 			}
@@ -934,9 +991,17 @@ void CInterfaceMPGameRoom::OpenCloseEmptySlot( const int nSlot, const bool bClos
 
 void CInterfaceMPGameRoom::MsgOk( const SGameMessage &msg )
 {
-	// Kick
-	OpenCloseEmptySlot( nRequestedSlotChangeIndex, bRequestedSlotChangeClosed );
+	// Kick, or put a bot in the player's place
+	if ( nRequestedSlotBotTeam >= 0 )
+	{
+		PutBotInSlot( nRequestedSlotChangeIndex, nRequestedSlotBotTeam );
+	}
+	else
+	{
+		OpenCloseEmptySlot( nRequestedSlotChangeIndex, bRequestedSlotChangeClosed );
+	}
 
+	nRequestedSlotBotTeam = -1;
 	nRequestedSlotChangeIndex = -1;
 	UpdateInterior();
 }

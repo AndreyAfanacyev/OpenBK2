@@ -129,7 +129,8 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
 	}
 
 	const int nScriptID = dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker );
-	if ( IsMobileReinforcement( nScriptID ) || ( bFromReinforcement && nScriptID == -1 ) )
+	// A bot has no scripted defenders on a multiplayer map: everything it owns can fight.
+	if ( theDipl.IsNetGame() || IsMobileReinforcement( nScriptID ) || ( bFromReinforcement && nScriptID == -1 ) )
 	{
 		if ( pWorker->IsFormation() )
 		{
@@ -175,7 +176,8 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
 				if ( pStats->IsTransport() )
 				{
 					const int nWorkerScriptID = dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker );
-					if ( IsMobileReinforcement( nWorkerScriptID ) || ( bFromReinforcement && nWorkerScriptID == -1 ) )
+					if ( theDipl.IsNetGame() || IsMobileReinforcement( nWorkerScriptID ) ||
+					     ( bFromReinforcement && nWorkerScriptID == -1 ) )
 					{
 						if ( pStats->etype == RPG_TYPE_TRN_CIVILIAN_AUTO )
 						{
@@ -203,7 +205,7 @@ void CGeneral::Give( CCommonUnit *pWorker, bool bFromReinforcement )
 				}
 				else
 				{
-					if ( bFromReinforcement ||
+					if ( theDipl.IsNetGame() || bFromReinforcement ||
 					     IsMobileReinforcement( dynamic_cast<CAILogic *>( Singleton<IAILogic>() )->GetScriptID( pWorker ) ) )
 					{
 						tanksFree.push_back( pWorker );
@@ -512,11 +514,11 @@ void CGeneral::Bombardment()
 			if ( cBombardmentType == 1 )
 			{
 				std::vector<EForceType> availFroces;
-				if ( theReinfArray[nParty].HasReinforcement( NDb::RT_GROUND_ATTACK_PLANES ) )
+				if ( theReinfArray[nPlayer].HasReinforcement( NDb::RT_GROUND_ATTACK_PLANES ) )
 				{
 					availFroces.push_back( FT_AIR_GUNPLANE );
 				}
-				if ( theReinfArray[nParty].HasReinforcement( NDb::RT_BOMBERS ) )
+				if ( theReinfArray[nPlayer].HasReinforcement( NDb::RT_BOMBERS ) )
 				{
 					availFroces.push_back( FT_AIR_BOMBER );
 				}
@@ -651,7 +653,10 @@ void CGeneral::GiveNewUnits( const std::list<CCommonUnit *> &pUnits, bool bFromR
 	for ( std::list<CCommonUnit *>::const_iterator iter = pUnits.begin(); iter != pUnits.end(); ++iter )
 	{
 		CCommonUnit *pUnit = *iter;
-		if ( theDipl.GetDiplStatusForParties( pUnit->GetParty(), nParty ) == EDI_FRIEND )
+		// A net game side can hold a person and a bot, and the bot must not take over allies' units.
+		const bool bOwned = theDipl.IsNetGame() ? pUnit->GetPlayer() == nPlayer
+		                                        : theDipl.GetDiplStatusForParties( pUnit->GetParty(), nParty ) == EDI_FRIEND;
+		if ( bOwned )
 		{
 			if ( pUnit->IsInFormation() && pUnit->GetFormation()->GetState()->GetName() != EUSN_GUN_CREW_STATE )
 			{
@@ -686,12 +691,21 @@ void CGeneral::Init()
 {
 	bSendReserves = false;
 	SGeneralConsts::Init();
-	pAirForce = new CGeneralAirForce( nParty, this );
+	pAirForce = new CGeneralAirForce( nParty, nPlayer, this );
 	pGeneralArtillery = new CGeneralArtillery( this );
 	pIntendant = new CGeneralIntendant( nParty, this );
 	pIntendant->Init();
 
-	tasks.push_back( new CGeneralTaskToSwarmToPoint( this ) );
+	if ( theDipl.IsNetGame() )
+	{
+		// Key points decide a multiplayer match. This task also attacks known resistance,
+		// so the swarm task would only compete with it for the same units.
+		tasks.push_back( new CGeneralTaskCaptureKeyPoints( this ) );
+	}
+	else
+	{
+		tasks.push_back( new CGeneralTaskToSwarmToPoint( this ) );
+	}
 
 	curProcessed = enemys.begin();
 
@@ -708,6 +722,13 @@ void CGeneral::Init( const NDb::SAIGeneralSide &mapInfo )
 	nMaxAllowedMobileTanks = mapInfo.nMaxMobileTanks;
 
 	Init();
+
+	if ( theDipl.IsNetGame() )
+	{
+		// Map parcels describe a scripted defence, which multiplayer maps don't have.
+		nMaxAllowedMobileTanks = SGeneralConsts::BOT_MAX_UNITS;
+		return;
+	}
 
 	bool bReinforceCreated = false;
 

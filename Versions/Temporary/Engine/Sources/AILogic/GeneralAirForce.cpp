@@ -41,7 +41,7 @@ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4AE, CGeneralAirForce );
 //*											CGeneralAirForce*
 //*******************************************************************
 
-CGeneralAirForce::CGeneralAirForce( const int nParty, IEnemyContainer *pEnemyContainer )
+CGeneralAirForce::CGeneralAirForce( const int nParty, const int nPlayer, IEnemyContainer *pEnemyContainer )
 	: pEnemyContainer( pEnemyContainer )
 	, nParty( nParty )
 	, bOurTurn( false )
@@ -50,7 +50,8 @@ CGeneralAirForce::CGeneralAirForce( const int nParty, IEnemyContainer *pEnemyCon
 {
 	for ( int i = 0; i < theDipl.GetNPlayers(); ++i )
 	{
-		if ( theDipl.GetNParty( i ) == nParty )
+		// A net game side can hold other players whose reinforcements are not ours to call.
+		if ( theDipl.IsNetGame() ? i == nPlayer : theDipl.GetNParty( i ) == nParty )
 		{
 			players.push_back( i );
 		}
@@ -78,7 +79,7 @@ void CGeneralAirForce::Segment()
 
 	for ( int i = 0; i < players.size(); ++i )
 	{
-		if ( players[i] != theDipl.GetMyNumber() )
+		if ( theDipl.IsNetGame() || players[i] != theDipl.GetMyNumber() )
 		{
 			const int nPlayer = players[i];
 

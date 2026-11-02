@@ -2,8 +2,12 @@
 
 #include "B2AI.h"
 #include "DebugTools/DebugInfoManager.h"
+#include "Building.h"
 #include "Formation.h"
+#include "KeyBuildingBonusSystem.h"
+#include "LinkObject.h"
 #include "GeneralConsts.h"
+#include "GeneralBotObjectives.h"
 #include "GeneralHelper.h"
 #include "GeneralInternal.h"
 #include "GeneralTasks.h"
@@ -26,6 +30,7 @@ extern NTimer::STime curTime;
 extern CDiplomacy theDipl;
 extern CGroupLogic theGroupLogic;
 extern CUnitCreation theUnitCreation;
+extern CKeyBuildingBonusSystem theBonusSystem;
 const float GetWeightOfUnit( const SUnitBaseRPGStats *pStats );
 
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D489, CGeneralSwarmWaitForReady );
@@ -33,6 +38,7 @@ REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D48A, CGeneralTaskToSwarmToPoint );
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D499, CGeneralTaskRecaptureStorage );
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4B1, CGeneralTaskToHoldReinforcement );
 REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4B2, CGeneralTaskToDefendPatch );
+REGISTER_SAVELOAD_CLASS( AILOGIC, 0x1508D4F1, CGeneralTaskCaptureKeyPoints );
 
 //*******************************************************************
 //*											CGeneralTaskToDefendPatch										*
@@ -204,7 +210,7 @@ void CGeneralTaskToDefendPatch::CalcSeverity( const bool bEnemyUpdated, const bo
 	if ( bEnemyUpdated )
 	{
 		fEnemyForce = 0;
-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveEnemies( this );
+		pOwner->GiveEnemies( this );
 	}
 
 	if ( bFriendlyUpdated )
@@ -227,7 +233,7 @@ void CGeneralTaskToDefendPatch::CalcSeverity( const bool bEnemyUpdated, const bo
 
 void CGeneralTaskToDefendPatch::CancelTask( ICommander *pManager )
 {
-	theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->RemoveResistance( patchInfo.vCenter );
+	pOwner->RemoveResistance( patchInfo.vCenter );
 
 	for ( CommonUnits::iterator it = infantryInTrenches.begin(); infantryInTrenches.end() != it; ++it )
 	{
@@ -299,12 +305,12 @@ void CGeneralTaskToDefendPatch::Segment()
 	if ( fFriendlyForce == 0.0f && !bResistanceRemoved ) // all stationary defenders are killed
 	{
 		bResistanceRemoved = true;
-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->RemoveResistance( patchInfo.vCenter );
+		pOwner->RemoveResistance( patchInfo.vCenter );
 	}
 	if ( fFriendlyForce != 0.0f && bResistanceRemoved )
 	{
 		bResistanceRemoved = false;
-		theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->AddResistance( patchInfo.vCenter, patchInfo.fRadius );
+		pOwner->AddResistance( patchInfo.vCenter, patchInfo.fRadius );
 	}
 }
 
@@ -831,7 +837,7 @@ void CGeneralTaskToSwarmToPoint::Segment()
 				//fSeverity = - 1;
 				fSeverity = 0;
 				ClearResistanceToAcceptNewTask();
-				theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveResistances( this );
+				pOwner->GiveResistances( this );
 
 				// wait for some time
 				bReleaseWorkers = !curResistanceToAttack.IsInitted();
@@ -911,7 +917,7 @@ void CGeneralTaskToSwarmToPoint::Segment()
 						}
 
 						ClearResistanceToAcceptNewTask();
-						theSupremeBeing.GetEnemyConatiner( pOwner->GetParty() )->GiveResistances( this );
+						pOwner->GiveResistances( this );
 						if ( curResistanceToAttack.IsInitted() )
 						{
 							SendToGroupPoint();
@@ -996,4 +1002,174 @@ bool CGeneralTaskToSwarmToPoint::EvaluateWorker( CCommonUnit *pUnit, const enum 
 	}
 
 	return true;
+}
+
+//*******************************************************************
+//*								CGeneralTaskCaptureKeyPoints								*
+//*******************************************************************
+namespace
+{
+// Enemies this close to a key point of ours mean it needs defending
+const float BOT_THREAT_RADIUS = 1000.0f;
+// Orders are only looked at this often; units keep their current order in between
+const int BOT_ORDERS_PERIOD = 6000;
+const int BOT_ORDERS_PERIOD_RANDOM = 2000;
+} // namespace
+
+void CGeneralTaskCaptureKeyPoints::AskForWorker( ICommander *pManager, const float fMaxSeverity, const bool bInit )
+{
+	pManager->EnumWorkers( FT_SWARMING_TANKS, this );
+	pManager->EnumWorkers( FT_FREE_INFANTRY, this );
+}
+
+float CGeneralTaskCaptureKeyPoints::EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const
+{
+	return float( pUnit->GetUniqueId() );
+}
+
+bool CGeneralTaskCaptureKeyPoints::EnumWorker( CCommonUnit *pUnit, const enum EForceType eType )
+{
+	SWorker &worker = workers.emplace_back();
+	worker.pUnit = pUnit;
+	return true;
+}
+
+void CGeneralTaskCaptureKeyPoints::CancelTask( ICommander *pManager )
+{
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		if ( IsValidObj( workers[i].pUnit ) )
+		{
+			pManager->Give( workers[i].pUnit );
+		}
+	}
+	workers.clear();
+}
+
+bool CGeneralTaskCaptureKeyPoints::EnumResistances( const SResistance &resistance )
+{
+	if ( resistance.GetWeight() > SGeneralConsts::MIN_WEIGHT_TO_SEND_SWARM )
+	{
+		resistanceCenters.push_back( resistance.GetResistanceCellCenter() );
+	}
+	return true;
+}
+
+void CGeneralTaskCaptureKeyPoints::CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints )
+{
+	const int nParty = pOwner->GetParty();
+	std::vector<int> links;
+	theBonusSystem.GetKeyBuildingLinks( &links );
+	for ( int i = 0; i < links.size(); ++i )
+	{
+		CBuilding *pBuilding = dynamic_cast<CBuilding *>( CLinkObject::GetObjectByLink( links[i] ) );
+		if ( !pBuilding || !pBuilding->IsAlive() )
+		{
+			continue;
+		}
+
+		const CVec2 vCenter( pBuilding->GetCenter().x, pBuilding->GetCenter().y );
+		const int nOwnerParty = theDipl.GetNParty( pBuilding->GetPlayer() );
+		if ( nOwnerParty == nParty )
+		{
+			pOwnPoints->push_back( vCenter );
+			for ( CUnitsIter<0, 3> iter( nParty, EDI_ENEMY, vCenter, BOT_THREAT_RADIUS ); !iter.IsFinished(); iter.Iterate() )
+			{
+				// Visibility check: a bot only reacts to what its side can really see.
+				if ( ( *iter )->IsAlive() && ( *iter )->IsVisible( nParty ) && !( *iter )->GetStats()->IsAviation() )
+				{
+					pTargets->push_back( vCenter );
+					break;
+				}
+			}
+		}
+		else if ( nOwnerParty != theDipl.GetNeutralParty() ||
+		          pBuilding->GetHitPoints() >= pBuilding->GetStats()->fMaxHP * 0.9f )
+		{
+			// A neutral key point under 90% health cannot be captured in this game mode (see CBuildingSimple::Segment).
+			pTargets->push_back( vCenter );
+		}
+	}
+
+	// Key points first; once the side holds them all, go after whatever it knows about.
+	if ( pTargets->empty() )
+	{
+		resistanceCenters.clear();
+		pOwner->GiveResistances( this );
+		pTargets->insert( pTargets->end(), resistanceCenters.begin(), resistanceCenters.end() );
+		resistanceCenters.clear();
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::GiveOrders()
+{
+	std::vector<CVec2> targets;
+	std::vector<CVec2> ownPoints;
+	CollectTargets( &targets, &ownPoints );
+	if ( targets.empty() )
+	{
+		targets = ownPoints; // Nothing to attack: stand on what we hold
+	}
+	if ( targets.empty() )
+	{
+		return;
+	}
+
+	std::vector<NBotObjectives::SWorker> plan( workers.size() );
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		plan[i].vPosition = workers[i].pUnit->GetCenterPlain();
+		plan[i].nTarget = -1;
+		if ( workers[i].bHasTarget )
+		{
+			plan[i].nTarget = NBotObjectives::FindTarget( targets, workers[i].vTarget );
+		}
+	}
+	NBotObjectives::AssignTargets( targets, &plan );
+
+	for ( int i = 0; i < workers.size(); ++i )
+	{
+		SWorker &worker = workers[i];
+		const CVec2 vTarget = targets[plan[i].nTarget];
+		const bool bNewTarget = !worker.bHasTarget || worker.vTarget != vTarget;
+		const float fCaptureRadius = SConsts::RADIUS_TO_TAKE_STORAGE_OWNERSHIP * 0.8f;
+		const bool bIdle = worker.pUnit->GetState() && worker.pUnit->GetState()->IsRestState();
+		worker.vTarget = vTarget;
+		worker.bHasTarget = true;
+
+		if ( bNewTarget )
+		{
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
+		}
+		else if ( bIdle && fabs( worker.pUnit->GetCenterPlain() - vTarget ) > fCaptureRadius )
+		{
+			// Arrived without getting into capture range, or the swarm ended early.
+			theGroupLogic.UnitCommand( SAIUnitCmd( ACTION_COMMAND_SWARM_TO, vTarget ), worker.pUnit, false );
+		}
+	}
+}
+
+void CGeneralTaskCaptureKeyPoints::Segment()
+{
+	const int nPlayer = pOwner->GetPlayer();
+	for ( int i = workers.size() - 1; i >= 0; --i )
+	{
+		// Dead, or given to an ally with the unit transfer order
+		if ( !IsValidObj( workers[i].pUnit ) || workers[i].pUnit->GetPlayer() != nPlayer )
+		{
+			workers.erase( workers.begin() + i );
+		}
+	}
+
+	if ( curTime < timeNextOrders )
+	{
+		return;
+	}
+	timeNextOrders = curTime + BOT_ORDERS_PERIOD + NRandom::Random( BOT_ORDERS_PERIOD_RANDOM );
+	RecordRandomCall();
+
+	if ( !workers.empty() )
+	{
+		GiveOrders();
+	}
 }

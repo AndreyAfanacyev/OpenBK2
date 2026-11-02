@@ -7,6 +7,9 @@ struct SGeneralConsts
 {
 	static int TIME_DONT_SEE_ENEMY_BEFORE_FORGET;
 
+	// A bot stops calling ground reinforcements at this many units under its command
+	static const int BOT_MAX_UNITS = 60;
+
 	static int SCOUT_FREE_POINT;
 	static int SCOUT_POINTS;
 	static NTimer::STime TIME_SONT_SEE_AA_BEFORE_FORGET;

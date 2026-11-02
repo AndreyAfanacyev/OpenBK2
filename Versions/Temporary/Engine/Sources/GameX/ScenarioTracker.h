@@ -416,6 +416,7 @@ struct IScenarioTracker : public IAIScenarioTracker
 	virtual void SetPlayerParty( const int nPlayer, const int nNewSide ) = 0;
 	virtual void SetPlayerSide( const int nPlayer, const int nNewTeam ) = 0;
 	virtual void SetPlayerColour( const int nPlayer, const int nNewColour ) = 0;
+	virtual void SetPlayerBot( const int nPlayer, const bool bBot ) {}
 
 	// Leaders (commanders)
 	virtual const SLeaderInfo *GetLeaderInfo( const NDb::EReinforcementType eReinf ) const = 0;

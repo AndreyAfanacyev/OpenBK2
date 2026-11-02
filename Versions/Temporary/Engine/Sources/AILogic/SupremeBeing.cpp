@@ -23,17 +23,23 @@ struct IEnemyContainer *CSupremeBeing::GetEnemyConatiner( int nParty )
 
 void CSupremeBeing::SetAAVisible( class CAIUnit *pUnit, const int nGeneralParty, const bool bVisible )
 {
-	if ( generals.find( nGeneralParty ) != generals.end() )
+	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
 	{
-		generals[nGeneralParty]->SetAAVisible( pUnit, bVisible );
+		if ( it->second->GetParty() == nGeneralParty )
+		{
+			it->second->SetAAVisible( pUnit, bVisible );
+		}
 	}
 }
 
 void CSupremeBeing::SetUnitVisible( class CAIUnit *pUnit, const int nGeneralParty, const bool bVisible )
 {
-	if ( generals.find( nGeneralParty ) != generals.end() )
+	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
 	{
-		generals[nGeneralParty]->SetUnitVisible( pUnit, bVisible );
+		if ( it->second->GetParty() == nGeneralParty )
+		{
+			it->second->SetUnitVisible( pUnit, bVisible );
+		}
 	}
 }
 
@@ -50,7 +56,20 @@ void CSupremeBeing::Clear()
 
 void CSupremeBeing::Init( const NDb::SMapInfo *pMapInfo )
 {
-	if ( !NGlobal::GetVar( "nogeneral", 0 ) && !theDipl.IsNetGame() )
+	if ( theDipl.IsNetGame() )
+	{
+		// One general per bot, in every client's simulation. The "nogeneral" console
+		// variable is deliberately not read here: it is per-client and would desync.
+		for ( int i = 0; i < pMapInfo->players.size(); ++i )
+		{
+			if ( theDipl.IsPlayerBot( i ) )
+			{
+				generals[i] = new CGeneral( theDipl.GetNParty( i ), i );
+				generals[i]->Init( pMapInfo->players[i].general );
+			}
+		}
+	}
+	else if ( !NGlobal::GetVar( "nogeneral", 0 ) )
 	{
 		for ( int i = 0; i < pMapInfo->players.size(); ++i )
 		{
@@ -67,7 +86,15 @@ void CSupremeBeing::Init( const NDb::SMapInfo *pMapInfo )
 
 void CSupremeBeing::GiveNewUnitsToGenerals( const std::list<CCommonUnit *> &pUnits, bool bFromReinforcement )
 {
-	if ( !NGlobal::GetVar( "nogeneral", 0 ) && !theDipl.IsNetGame() )
+	if ( theDipl.IsNetGame() )
+	{
+		// Each bot filters out its own player's units.
+		for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
+		{
+			it->second->GiveNewUnits( pUnits, true );
+		}
+	}
+	else if ( !NGlobal::GetVar( "nogeneral", 0 ) )
 	{
 		generals[1]->GiveNewUnits( pUnits, bFromReinforcement );
 	}
@@ -85,12 +112,38 @@ bool CSupremeBeing::IsIronman( const int nScriptGroup ) const
 
 bool CSupremeBeing::IsMobileReinforcement( int nParty, int nGroup ) const
 {
-	Generals::const_iterator it = generals.find( nParty );
-	if ( it != generals.end() )
+	for ( Generals::const_iterator it = generals.begin(); it != generals.end(); ++it )
 	{
-		return ( it->second )->IsMobileReinforcement( nGroup );
+		if ( it->second->GetParty() == nParty && it->second->IsMobileReinforcement( nGroup ) )
+		{
+			return true;
+		}
 	}
 	return false;
+}
+
+bool CSupremeBeing::HasGeneralInParty( const int nParty ) const
+{
+	for ( Generals::const_iterator it = generals.begin(); it != generals.end(); ++it )
+	{
+		if ( it->second->GetParty() == nParty )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool CSupremeBeing::HasGeneralForPlayer( const int nPlayer ) const
+{
+	return generals.find( nPlayer ) != generals.end();
+}
+
+CGeneral *CSupremeBeing::GetGeneralOfUnit( const CCommonUnit *pUnit )
+{
+	// Single player: the one general owns its whole party. Net game: a bot owns only its player's units.
+	const Generals::iterator it = generals.find( theDipl.IsNetGame() ? pUnit->GetPlayer() : pUnit->GetParty() );
+	return it == generals.end() ? 0 : it->second.GetPtr();
 }
 
 void CSupremeBeing::AddReinforcement( class CAIUnit *pUnit )
@@ -103,9 +156,9 @@ void CSupremeBeing::AddReinforcement( class CAIUnit *pUnit )
 
 void CSupremeBeing::Segment()
 {
-	if ( !NGlobal::GetVar( "temp.nogeneral_sript", 0 ) )
+	if ( theDipl.IsNetGame() || !NGlobal::GetVar( "temp.nogeneral_sript", 0 ) )
 	{
-		if ( !theDipl.IsNetGame() )
+		// Empty in a net game without bots, so such a match runs exactly as before.
 		{
 			// запуск отложенных заждач
 			for ( DelayedTasks::iterator it = delayedTasks.begin(); it != delayedTasks.end(); )
@@ -145,14 +198,17 @@ void CSupremeBeing::UpdateEnemyUnitInfo( CAIUnitInfoForGeneral *pInfo,
 {
 	const int nGeneralParty = 1 - pInfo->GetOwner()->GetParty();
 
-	if ( nGeneralParty == 1 && generals.find( nGeneralParty ) != generals.end() )
+	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
 	{
-		generals[nGeneralParty]->UpdateEnemyUnitInfo( pInfo,
-		                                              lastVisibleTimeDelta,
-		                                              vLastVisiblePos,
-		                                              lastAntiArtTimeDelta,
-		                                              vLastVisibleAntiArtCenter,
-		                                              fDistToLastVisibleAntiArt );
+		if ( it->second->GetParty() == nGeneralParty )
+		{
+			it->second->UpdateEnemyUnitInfo( pInfo,
+			                                 lastVisibleTimeDelta,
+			                                 vLastVisiblePos,
+			                                 lastAntiArtTimeDelta,
+			                                 vLastVisibleAntiArtCenter,
+			                                 fDistToLastVisibleAntiArt );
+		}
 	}
 }
 
@@ -176,10 +232,9 @@ void CSupremeBeing::UnitChangedPosition( class CCommonUnit *pUnit, const CVec2 &
 {
 	if ( AICellsTiles::GetGeneralCell( pUnit->GetCenterPlain() ) != AICellsTiles::GetGeneralCell( vNewPos ) )
 	{
-		Generals::iterator it = generals.find( pUnit->GetParty() );
-		if ( it != generals.end() )
+		if ( CGeneral *pGeneral = GetGeneralOfUnit( pUnit ) )
 		{
-			it->second->UnitChangedPosition( pUnit, vNewPos );
+			pGeneral->UnitChangedPosition( pUnit, vNewPos );
 		}
 	}
 }
@@ -200,10 +255,9 @@ void CSupremeBeing::UnitAskedForResupply( class CCommonUnit *pUnit, const EResup
 	}
 	else
 	{
-		Generals::iterator it = generals.find( pUnit->GetParty() );
-		if ( it != generals.end() )
+		if ( CGeneral *pGeneral = GetGeneralOfUnit( pUnit ) )
 		{
-			it->second->UnitAskedForResupply( pUnit, eType, bSet );
+			pGeneral->UnitAskedForResupply( pUnit, eType, bSet );
 		}
 	}
 }
@@ -221,9 +275,12 @@ void CSupremeBeing::UnitChangedParty( CAIUnit *pUnit, const int nNewParty )
 
 bool CSupremeBeing::IsInResistanceCircle( const CVec2 &vPoint, const int nGeneralParty )
 {
-	if ( generals.find( nGeneralParty ) != generals.end() )
+	for ( Generals::iterator it = generals.begin(); it != generals.end(); ++it )
 	{
-		return generals[nGeneralParty]->IsInResistanceCircle( vPoint );
+		if ( it->second->GetParty() == nGeneralParty && it->second->IsInResistanceCircle( vPoint ) )
+		{
+			return true;
+		}
 	}
 	return false;
 }

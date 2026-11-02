@@ -52,10 +52,10 @@ bool CMPManagerMode::HostAssignNewClient( int nClientID )
 			pGameInfoPkt->info = gameDesc;
 			pClient->SendGamePacket( pGameInfoPkt, false );
 
-			// Send closed slots
+			// Send closed slots, and bots, which have no client to introduce them
 			for ( int nSlot = 0; nSlot < slots.size(); ++nSlot )
 			{
-				if ( !slots[nSlot].bPresent && slots[nSlot].bAccept )
+				if ( ( !slots[nSlot].bPresent && slots[nSlot].bAccept ) || slots[nSlot].bBot )
 				{
 					pClient->SendGamePacket( new CB2SlotInfoPacket( nClientID, nSlot, slots[nSlot] ), false );
 				}

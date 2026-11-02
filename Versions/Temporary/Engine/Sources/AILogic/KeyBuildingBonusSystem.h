@@ -26,6 +26,8 @@ public:
 	bool IsStorage( int nLinkID ) const;
 	void InitBonusSystem( const NDb::SMapInfo *pMapInfo );
 	bool IsKeyBuilding( int nLinkID ) const;
+	// Bots go after these. Link IDs in ascending order, so every client sees the same list.
+	void GetKeyBuildingLinks( std::vector<int> *pLinks ) const;
 
 	void SendUpdates() const;
 

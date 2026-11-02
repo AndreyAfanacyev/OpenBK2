@@ -36,7 +36,10 @@ bool CMPManagerMode::OnB2SlotInfoPacket( class CB2SlotInfoPacket *pPacket )
 	{
 		if ( nOwnSlot >= 0 )
 		{
-			pClient->SendGamePacket( new CPingPacket( pPacket->nClientID, nOwnSlot, GameTimer()->GetAbsTime() ), false );
+			if ( !pPacket->info.bBot )
+			{
+				pClient->SendGamePacket( new CPingPacket( pPacket->nClientID, nOwnSlot, GameTimer()->GetAbsTime() ), false );
+			}
 		}
 		// Only clients increase slot counter here, server increases it in NEW_CLIENT handler
 		if ( !IsGameHost() )
@@ -52,7 +55,8 @@ bool CMPManagerMode::OnB2SlotInfoPacket( class CB2SlotInfoPacket *pPacket )
 	SMPSlot &slot = slots[pPacket->nSlot];
 	int nStoredPing = slot.nPing;
 	slot = pPacket->info;
-	slot.nClientID = pPacket->nClientID;
+	// A bot's slot arrives from the host, but the slot must not become the host's.
+	slot.nClientID = pPacket->info.bBot ? -1 : pPacket->nClientID;
 	slot.nPing = nStoredPing;
 
 	if ( nOwnSlot >= 0 )
@@ -423,6 +427,18 @@ bool CMPManagerMode::OnB2GameLostPacket( class CB2GameLostPacket *pPacket )
 	                              "CB2GameLostPacket",
 	                              pPacket->nClientID,
 	                              fmt::format( "game_id={} segment={}", pPacket->nGameID, pPacket->nSegment ) );
+
+	if ( pPacket->nBotTeam >= 0 )
+	{
+		const bool bPacketWinsGame = slots[nOwnSlot].nTeam != pPacket->nBotTeam;
+		if ( !bOutcomeKnown || bWinOnGameEnd == bPacketWinsGame )
+		{
+			pTransceiver->ScheduleGameEnd( pPacket->nSegment );
+			bOutcomeKnown = true;
+			bWinOnGameEnd = bPacketWinsGame;
+		}
+		return true;
+	}
 
 	//DebugTrace( "+++ GameLost packet" );
 	for ( int i = 0; i < slots.size(); ++i )

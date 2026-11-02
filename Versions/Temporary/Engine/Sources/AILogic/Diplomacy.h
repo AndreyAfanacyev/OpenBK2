@@ -22,6 +22,7 @@ private:
 	int nMyNumber = {};
 
 	std::vector<int> isPlayerExist;
+	std::vector<int> isPlayerBot; // net game players driven by a CGeneral
 
 	bool bNetGame = {};
 
@@ -96,7 +97,23 @@ public:
 
 	const bool IsAIPlayer( const uint8_t cPlayer ) const
 	{
-		return !bNetGame && cPlayer != GetMyNumber();
+		// In a net game this must not depend on the local player: all clients have to agree.
+		return bNetGame ? IsPlayerBot( cPlayer ) : cPlayer != GetMyNumber();
+	}
+
+	const bool IsPlayerBot( const uint8_t cPlayer ) const
+	{
+		return cPlayer < isPlayerBot.size() && isPlayerBot[cPlayer] != 0;
+	}
+
+	// Test and lobby-independent setup; a match gets this from the scenario tracker in Load
+	void SetPlayerBot( const int nPlayer, const bool bBot )
+	{
+		if ( nPlayer >= isPlayerBot.size() )
+		{
+			isPlayerBot.resize( nPlayer + 1, 0 );
+		}
+		isPlayerBot[nPlayer] = bBot ? 1 : 0;
 	}
 
 	const uint8_t GetNeutralPlayer() const

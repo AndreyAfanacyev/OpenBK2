@@ -331,3 +331,106 @@ public:
 		pGeneralTask->Run();
 	}
 };
+
+// ****
+// Net game bots: take the key points that decide a match, and fight what is known about on the way.
+// ****
+class CGeneralTaskCaptureKeyPoints : public IGeneralTask, public IWorkerEnumerator, public IEnemyEnumerator
+{
+	OBJECT_BASIC_METHODS( CGeneralTaskCaptureKeyPoints );
+
+	struct SWorker
+	{
+		ZDATA
+		CPtr<CCommonUnit> pUnit;
+		CVec2 vTarget;
+		bool bHasTarget = {};
+
+		ZEND int operator&( IBinSaver &f )
+		{
+			f.Add( 2, &pUnit );
+			f.Add( 3, &vTarget );
+			f.Add( 4, &bHasTarget );
+			return 0;
+		}
+	};
+
+	ZDATA
+	CPtr<CGeneral> pOwner;
+	std::vector<SWorker> workers;
+	NTimer::STime timeNextOrders = {};
+
+	ZEND int operator&( IBinSaver &f ) override
+	{
+		f.Add( 2, &pOwner );
+		f.Add( 3, &workers );
+		f.Add( 4, &timeNextOrders );
+		return 0;
+	}
+
+	std::vector<CVec2> resistanceCenters; // only filled while enumerating, see EnumResistances
+
+	void CollectTargets( std::vector<CVec2> *pTargets, std::vector<CVec2> *pOwnPoints );
+	void GiveOrders();
+
+public:
+	CGeneralTaskCaptureKeyPoints() {}
+
+	CGeneralTaskCaptureKeyPoints( class CGeneral *_pOwner )
+		: pOwner( _pOwner )
+	{
+	}
+
+	ETaskName GetName() const override
+	{
+		return ETN_CAPTURE_KEY_POINTS;
+	}
+
+	void AskForWorker( ICommander *pManager, const float fMaxSeverity, const bool bInit = false ) override;
+
+	// Nothing to give back: on a multiplayer map every unit has a key point to go to
+	void ReleaseWorker( ICommander *pManager, const float fMinSeverity ) override {}
+
+	float GetSeverity() const override
+	{
+		return 0.0f;
+	}
+
+	bool IsFinished() const override
+	{
+		return false;
+	}
+
+	void CancelTask( ICommander *pManager ) override;
+	void Segment() override;
+
+	int GetWorkerCount() override
+	{
+		return workers.size();
+	}
+
+	// IWorkerEnumerator
+	bool EnumWorker( class CCommonUnit *pUnit, const enum EForceType eType ) override;
+
+	bool EvaluateWorker( CCommonUnit *pUnit, const enum EForceType eType ) const override
+	{
+		return true;
+	}
+
+	// Asking for "the best several" makes the commander sort by rating. Unique IDs leave
+	// no ties for std::sort to order differently from one platform to another.
+	int NeedNBest( const enum EForceType eType ) const override
+	{
+		return 2;
+	}
+
+	float EvaluateWorkerRating( CCommonUnit *pUnit, const enum EForceType eType ) const override;
+
+	// IEnemyEnumerator
+	bool EnumEnemy( class CAIUnit *pEnemy ) override
+	{
+		return false;
+	}
+
+	bool EnumResistances( const struct SResistance &resistance ) override;
+};

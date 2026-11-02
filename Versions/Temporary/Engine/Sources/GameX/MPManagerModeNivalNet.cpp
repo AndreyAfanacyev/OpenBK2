@@ -506,7 +506,7 @@ void CMPManagerModeNivalNet::ProcessLadderWaitForClients()
 		SMPSlot &slot = slots[i];
 		if ( slot.bPresent )
 		{
-			if ( slot.bAccept && slot.wConnectedTo == slots[nOwnSlot].wConnectedTo )
+			if ( slot.bBot || ( slot.bAccept && slot.wConnectedTo == slots[nOwnSlot].wConnectedTo ) )
 			{
 				++nClientsConnected;
 			}

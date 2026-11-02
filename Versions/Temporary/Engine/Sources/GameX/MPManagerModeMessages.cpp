@@ -162,16 +162,39 @@ bool CMPManagerMode::OnUpdateSlotMessage( SMPUIUpdateSlotMessage *pMsg )
 		// Process slot open/close
 		if ( IsGameHost() && newSlot.bPresent == false )
 		{
-			if ( oldSlot.bPresent ) // Kick player
+			if ( oldSlot.bBot ) // Bot removed: there is no client to kick
+			{
+				--nSlotsUsed;
+			}
+			else if ( oldSlot.bPresent ) // Kick player
 			{
 				KickPlayerFromSlot( pMsg->nSlot );
 				RemoveClient( oldSlot.nClientID, true );
 				--nSlotsUsed;
 			}
 		}
+		else if ( IsGameHost() && newSlot.bBot && !oldSlot.bBot )
+		{
+			// Bot added. A person's slot is counted in the new client handler, a bot has none.
+			if ( oldSlot.bPresent )
+			{
+				KickPlayerFromSlot( pMsg->nSlot );
+				RemoveClient( oldSlot.nClientID, true ); // also counts the slot as free
+				// RemoveClient told the UI the slot is empty; it holds the bot from here on.
+				SMPUIUpdateSlotMessage *pUpdateMsg = new SMPUIUpdateSlotMessage;
+				pUpdateMsg->nSlot = pMsg->nSlot;
+				pUpdateMsg->info = newSlot;
+				PushMessage( pUpdateMsg );
+			}
+			++nSlotsUsed;
+		}
 		uint16_t wOldConnectMask = oldSlot.wConnectedTo;
 		oldSlot = newSlot;
 		oldSlot.wConnectedTo = wOldConnectMask;
+		if ( newSlot.bBot )
+		{
+			oldSlot.nClientID = -1;
+		}
 		pClient->SendGamePacket( new CB2SlotInfoPacket( 0, pMsg->nSlot, newSlot ), true );
 	}
 	else

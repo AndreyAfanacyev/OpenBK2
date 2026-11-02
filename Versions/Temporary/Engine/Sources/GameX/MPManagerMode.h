@@ -174,6 +174,8 @@ private:
 	bool OnB2UserPausePacket( class CB2UserPausePacket *pPacket );
 	bool OnB2DropPlayerAtSegmentPacket( class CB2DropPlayerAtSegmentPacket *pPacket );
 	bool OnB2GameLostPacket( class CB2GameLostPacket *pPacket );
+	bool IsTeamOnlyBots( int nTeam ) const;
+	void ScheduleBotTeamLoss( int nTeam );
 	bool OnPingPacket( class CPingPacket *pPacket );
 	//}
 
@@ -299,20 +301,25 @@ public:
 	ZDATA
 	int nGameID;
 	int nSegment;
+	int nBotTeam = -1;
 
 	ZEND int operator&( IBinSaver &f ) override
 	{
 		f.Add( 2, &nGameID );
 		f.Add( 3, &nSegment );
+		f.Add( 4, &nBotTeam );
 		return 0;
 	}
 
 	CB2GameLostPacket() {}
 
-	CB2GameLostPacket( const int nClientID, const int _nGameID, const int _nSegment )
+	// _nBotTeam is the team of bots that lost, when the host announces it for them.
+	// -1 means the sender's own team lost.
+	CB2GameLostPacket( const int nClientID, const int _nGameID, const int _nSegment, const int _nBotTeam = -1 )
 		: CNetPacket( nClientID )
 		, nGameID( _nGameID )
 		, nSegment( _nSegment )
+		, nBotTeam( _nBotTeam )
 	{
 	}
 };

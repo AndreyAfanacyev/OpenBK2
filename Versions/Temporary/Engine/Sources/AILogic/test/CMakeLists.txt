@@ -112,3 +112,16 @@ if(WIN32)
     set_tests_properties(ScriptGroupWait_test PROPERTIES
         ENVIRONMENT_MODIFICATION "PATH=path_list_append:${FFMPEG_BIN}")
 endif()
+
+# Net game bots. Linux only for now: these tests reach simulation classes that the AILogic DLL doesn't export on Windows.
+if(NOT WIN32)
+    # How bots share units between key points, and that bots don't depend on the local player.
+    add_unit_test(NetBotObjectives AILogic Common_RTS_AI Stats_B2_M1 libdb System Misc zlib gr2)
+    set_tests_properties(NetBotObjectives_test PROPERTIES TIMEOUT 60)
+
+    # A bot end to end on real units and the real general, from each client's point of view.
+    add_unit_test(NetBotGeneral AILogic Common_RTS_AI Stats_B2_M1 libdb System Misc zlib gr2)
+    target_compile_definitions(NetBotGeneral_test PRIVATE
+        NET_BOT_TYPES_FILE="${CMAKE_SOURCE_DIR}/Versions/Current/Data/types.xml")
+    set_tests_properties(NetBotGeneral_test PROPERTIES TIMEOUT 60)
+endif()

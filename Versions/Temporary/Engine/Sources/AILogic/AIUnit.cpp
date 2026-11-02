@@ -1045,6 +1045,12 @@ void CAIUnit::FreezeSegment()
 
 		pUnitInfoForGeneral->Segment();
 	}
+	else if ( theSupremeBeing.HasGeneralInParty( 1 - GetParty() ) )
+	{
+		// Reports this unit's position to the enemy side's bots. It draws random numbers,
+		// which is fine in lockstep: this condition is the same on every client.
+		pUnitInfoForGeneral->Segment();
+	}
 
 	// обработка TankPit
 	if ( !IsValidObj( pTankPit ) )
@@ -1087,8 +1093,11 @@ void CAIUnit::CalcVisibility( const bool bIgnoreTime )
 			if ( bVisibilityChanged )
 			{
 				theSupremeBeing.SetUnitVisible( this, i, bVisibility );
-				if ( theDipl.GetNeutralPlayer() != GetPlayer() && !theDipl.IsAIPlayer( GetPlayer() ) &&
-				     theDipl.IsAIPlayer( i ) )
+				// Net game: tell the bots of the side that can now see this enemy, bots' own units included.
+				const bool bReportToGeneral = theDipl.IsNetGame()
+				                                ? GetParty() != i && theSupremeBeing.HasGeneralInParty( i )
+				                                : !theDipl.IsAIPlayer( GetPlayer() ) && theDipl.IsAIPlayer( i );
+				if ( theDipl.GetNeutralPlayer() != GetPlayer() && bReportToGeneral )
 				{
 					pUnitInfoForGeneral->UpdateVisibility( bVisibility );
 				}
@@ -1295,7 +1304,10 @@ void CAIUnit::Fired( const float fGunRadius, const int nGun )
 
 void CAIUnit::UpdateUnitsRequestsForResupply()
 {
-	if ( !theDipl.IsNetGame() )
+	// Bots keep their own units supplied and pick up abandoned neutral guns, same as the single player general.
+	const bool bNeutralForBots = GetParty() == theDipl.GetNeutralParty() &&
+	                             ( theSupremeBeing.HasGeneralInParty( 0 ) || theSupremeBeing.HasGeneralInParty( 1 ) );
+	if ( !theDipl.IsNetGame() || theSupremeBeing.HasGeneralForPlayer( GetPlayer() ) || bNeutralForBots )
 	{
 		if ( !IsAlive() || IsRefInvalid() )
 		{
@@ -1354,10 +1366,8 @@ void CAIUnit::ChangePlayer( const uint8_t cPlayer )
 	if ( GetParty() != theDipl.GetNParty( cPlayer ) )
 	{
 		theFeedBackSystem.RemovedAllFeedbacks( nUniqueID );
-		if ( !theDipl.IsNetGame() )
-		{
-			theSupremeBeing.UnitChangedParty( this, theDipl.GetNParty( cPlayer ) );
-		}
+		// Generals are empty in a net game without bots, so this is a no-op there.
+		theSupremeBeing.UnitChangedParty( this, theDipl.GetNParty( cPlayer ) );
 	}
 
 	if ( theBalanceTest.IsActive() && !theBalanceTest.HasShoot( GetPlayer() ) )

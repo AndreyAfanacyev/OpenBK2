@@ -686,7 +686,10 @@ void CGeneralArtilleryTask::Segment()
 		bool bWrongParty = false;
 		if ( IsValidObj( pUnit ) )
 		{
-			bWrongParty = !IsArtilleryBeingTowed( pUnit ) && pUnit->GetParty() == theDipl.GetMyParty();
+			// The local player must not decide this in a net game: every client has to agree.
+			bWrongParty = !IsArtilleryBeingTowed( pUnit ) &&
+			              ( theDipl.IsNetGame() ? !theDipl.IsPlayerBot( pUnit->GetPlayer() )
+			                                    : pUnit->GetParty() == theDipl.GetMyParty() );
 		}
 
 		if ( !IsValidObj( pUnit ) || bWrongParty )

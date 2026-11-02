@@ -1,5 +1,6 @@
 #include "stdafx.h"
 
+#include "Diplomacy.h"
 #include "Formation.h"
 #include "GeneralAirForce.h"
 #include "GeneralInternal.h"
@@ -192,7 +193,9 @@ void CGeneral::BalanceUpdate( EBalanceAction eAction, CCommonUnit *_pUnit )
 		effects[i] = 0.0;
 
 		// Get availability for enemy
-		nAvail = theReinfArray[nUnitParty].GetUnitAvailability( eUType, NDb::EReinforcementType( i ) );
+		// The array is per player. A party number only happens to match one in single player.
+		nAvail = theReinfArray[theDipl.IsNetGame() ? pUnit->GetPlayer() : nUnitParty].GetUnitAvailability(
+				eUType, NDb::EReinforcementType( i ) );
 
 		if ( nAvail )
 		{

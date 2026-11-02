@@ -74,4 +74,11 @@ public:
 	bool IsIronman( const int nScriptGroup ) const;
 
 	bool IsInResistanceCircle( const CVec2 &vPoint, const int nGeneralParty );
+
+	// In a net game a side can hold several bots, so generals are keyed by player there
+	bool HasGeneralInParty( const int nParty ) const;
+	bool HasGeneralForPlayer( const int nPlayer ) const;
+
+private:
+	CGeneral *GetGeneralOfUnit( const class CCommonUnit *pUnit );
 };

@@ -96,7 +96,7 @@ private:
 public:
 	CGeneralAirForce() {}
 
-	CGeneralAirForce( const int nPlayer, IEnemyContainer *pEnemyContainer );
+	CGeneralAirForce( const int nParty, const int nPlayer, IEnemyContainer *pEnemyContainer );
 
 	void Segment() override;
 	void Give( CCommonUnit *pWorker ) override;

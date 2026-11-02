@@ -1328,6 +1328,15 @@ void CAILogic::InitAfterMapLoad( const struct NDb::SMapInfo *pMapInfo )
 	}
 	else if ( GetScenarioTracker()->GetGameType() == IAIScenarioTracker::EGT_MULTI_FLAG_CONTROL )
 	{
+		// Bots first: their generals have to exist to receive the starting units below.
+		theSupremeBeing.Init( pMapInfo );
+		std::list<CCommonUnit *> pUnits;
+		for ( CGlobalIter iter( 0, ANY_PARTY ); !iter.IsFinished(); iter.Iterate() )
+		{
+			pUnits.push_back( *iter );
+		}
+		theSupremeBeing.GiveNewUnitsToGenerals( pUnits );
+
 		// Call starting units reinforcement for this game mode
 		theReinfArray.PlaceInitialUnits();
 	}

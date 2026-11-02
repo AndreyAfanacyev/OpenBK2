@@ -21,6 +21,7 @@ struct SMPSlot
 	bool bRandomCountry = {};
 	int nPing = {}; // -1 means no data
 	uint16_t wConnectedTo = {};
+	bool bBot = {}; // played by the AI general on every client; has no client of its own
 
 	ZEND int operator&( IBinSaver &f )
 	{
@@ -34,6 +35,7 @@ struct SMPSlot
 		f.Add( 9, &bRandomCountry );
 		f.Add( 10, &nPing );
 		f.Add( 11, &wConnectedTo );
+		f.Add( 12, &bBot );
 		return 0;
 	}
 
@@ -63,6 +65,7 @@ struct SMPSlot
 		bAccept = false;
 		nPing = -1;
 		wConnectedTo = 0;
+		bBot = false;
 	}
 
 	SMPSlot &operator=( const SMPSlot &src )
@@ -77,6 +80,7 @@ struct SMPSlot
 		bAccept = src.bAccept;
 		nPing = src.nPing;
 		wConnectedTo = src.wConnectedTo;
+		bBot = src.bBot;
 		return *this;
 	}
 };

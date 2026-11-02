@@ -60,6 +60,7 @@ class CInterfaceMPGameRoom : public CInterfaceMPScreenBase, public IProgrammedRe
 	bool bHost;
 	int nRequestedSlotChangeIndex;
 	bool bRequestedSlotChangeClosed;
+	int nRequestedSlotBotTeam = -1; // team of the bot that replaces the kicked player, -1 for none
 	CPtr<IWindow> pAdvancedPopup;
 	CPtr<ITextView> pCantStartAccept;
 	CPtr<ITextView> pCantStartSide;
@@ -103,6 +104,7 @@ private:
 	void CheckStartConditions();
 	void ReturnToGamesList();
 	void OpenCloseEmptySlot( const int nSlot, const bool bClosed );
+	void PutBotInSlot( const int nSlot, const int nTeam );
 
 	void SendUpdateSlot( const int nSlot );
 

@@ -93,6 +93,14 @@ struct IAIScenarioTracker : public CObjectBase
 	virtual void AddPlayer( const int nPlayer ) = 0;
 	virtual void RemovePlayer( const int nPlayer ) = 0;
 	virtual bool IsPlayerPresent( const int nPlayer ) const = 0;
+
+	// A multiplayer slot played by the AI general instead of a person. Every client
+	// reads the same value, so the general runs identically in all simulations.
+	virtual bool IsPlayerBot( const int nPlayer ) const
+	{
+		return false;
+	}
+
 	virtual int GetLocalPlayer() const = 0;
 	virtual void SetLocalPlayer( int nPlayer ) = 0;
 	virtual int GetNPlayers() const = 0;

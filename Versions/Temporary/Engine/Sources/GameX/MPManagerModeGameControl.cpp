@@ -33,7 +33,16 @@ void CMPManagerMode::StartGame()
 	// Do all initialising
 	SB2StartGameParams tranParams;
 	tranParams.pMapInfo = gameDesc.pMPMap->pMap;
-	tranParams.clients.resize( nSlotsUsed );
+	// Bots hold slots but send nothing, so lockstep must not wait for them.
+	int nClients = 0;
+	for ( int i = 0; i < slots.size(); ++i )
+	{
+		if ( IsPlayerPresent( i ) && !slots[i].bBot )
+		{
+			++nClients;
+		}
+	}
+	tranParams.clients.resize( nClients );
 	tranParams.nSpeedAdjustment = gameDesc.nGameSpeed;
 
 	// Scenario tracker
@@ -82,6 +91,7 @@ void CMPManagerMode::StartGame()
 		pScenarioTracker->SetPlayerSide( i, slot.nTeam );
 		pScenarioTracker->SetPlayerParty( i, slot.nCountry );
 		pScenarioTracker->SetPlayerColour( i, slot.nColour );
+		pScenarioTracker->SetPlayerBot( i, slot.bBot );
 
 		IScenarioTracker::SMultiplayerInfo::SPlayer &scenarioPlayer = scenarioInfo.players.emplace_back();
 		scenarioPlayer.wszName = NStr::ToUnicode( slot.szName );
@@ -91,18 +101,18 @@ void CMPManagerMode::StartGame()
 		scenarioPlayer.nLevel = 1;
 		scenarioPlayer.wszRank = L"";
 
-		if ( nTranSlot < tranParams.clients.size() )
+		if ( !slot.bBot && nTranSlot < tranParams.clients.size() )
 		{
 			tranParams.clients[nTranSlot].nClientID = slot.nClientID;
 			tranParams.clients[nTranSlot].nPlayer = i;
 			tranParams.clients[nTranSlot].nTeam = slot.nTeam;
 			++nTranSlot;
 		}
-		NI_ASSERT( nTranSlot <= nSlotsUsed, "PRG: Incorrectly counted used slots." );
+		NI_ASSERT( nTranSlot <= nClients, "PRG: Incorrectly counted used slots." );
 	}
 	pScenarioTracker->SetMultiplayerInfo( scenarioInfo );
-	NI_ASSERT( nTranSlot == nSlotsUsed,
-	           fmt::format( "PRG: Incorrectly counted used slots - {}/{}.", nTranSlot, nSlotsUsed ) );
+	NI_ASSERT( nTranSlot == nClients,
+	           fmt::format( "PRG: Incorrectly counted used slots - {}/{}.", nTranSlot, nClients ) );
 	pScenarioTracker->SetLocalPlayer( nOwnSlot );
 
 	NGlobal::SetVar( "multiplayer_time_limit", -1 );
@@ -202,6 +212,39 @@ void CMPManagerMode::ScheduleWinGame()
 	}
 	pTransceiver->ScheduleGameEnd( nLastOpponentDrop );
 	bWinOnGameEnd = true;
+	bOutcomeKnown = true;
+}
+
+bool CMPManagerMode::IsTeamOnlyBots( const int nTeam ) const
+{
+	bool bHasBots = false;
+	for ( int i = 0; i < slots.size(); ++i )
+	{
+		if ( slots[i].bPresent && slots[i].nTeam == nTeam )
+		{
+			if ( !slots[i].bBot )
+			{
+				return false;
+			}
+			bHasBots = true;
+		}
+	}
+	return bHasBots;
+}
+
+void CMPManagerMode::ScheduleBotTeamLoss( const int nTeam )
+{
+	// Normally the losers announce their own defeat, but bots have no client to do it.
+	// The game control host speaks for them, so all clients end on the same segment.
+	if ( bOutcomeKnown || !IsValid( pTransceiver ) || !IsGameControlHost() )
+	{
+		return;
+	}
+	const int nSegment = pTransceiver->ScheduleGameEnd( -1 );
+	NGameX::MatchPacketTrace_Log(
+			nSegment, "TX", "CB2GameLostPacket", GetOwnClientID(), fmt::format( "game_id={} bot_team={}", nGameID, nTeam ) );
+	BroadcastGameControlPacket( new CB2GameLostPacket( 0, nGameID, nSegment, nTeam ) );
+	bWinOnGameEnd = slots[nOwnSlot].nTeam != nTeam;
 	bOutcomeKnown = true;
 }
 
@@ -406,6 +449,11 @@ bool CMPManagerMode::CheckScoreWinLose()
 			ScheduleLoseGame();
 			return true;
 		}
+		if ( IsTeamOnlyBots( nLostTeam ) )
+		{
+			ScheduleBotTeamLoss( nLostTeam );
+			return bOutcomeKnown;
+		}
 	}
 	return false;
 }
@@ -474,6 +522,14 @@ bool CMPManagerMode::CheckKeyBuildingsWinLose()
 					ScheduleLoseGame();
 					return true;
 				}
+				if ( IsTeamOnlyBots( 1 - nWinningSide ) )
+				{
+					ScheduleBotTeamLoss( 1 - nWinningSide );
+					if ( bOutcomeKnown )
+					{
+						return true;
+					}
+				}
 			}
 		}
 	}
@@ -512,6 +568,27 @@ bool CMPManagerMode::CheckInstantLose()
 			ScheduleLoseGame();
 			return true;
 		}
+
+		// The same rule for a team of bots: no key points and no units left
+		const int nLosingTeam = 1 - nWinningSide;
+		if ( ( nWinningSide == 0 || nWinningSide == 1 ) && IsTeamOnlyBots( nLosingTeam ) )
+		{
+			bool bAnyUnits = false;
+			for ( int i = 0; i < slots.size(); ++i )
+			{
+				if ( IsPlayerPresent( i ) && slots[i].nTeam == nLosingTeam &&
+				     !Singleton<IAILogic>()->HasPlayerNoUnits( i ) )
+				{
+					bAnyUnits = true;
+					break;
+				}
+			}
+			if ( !bAnyUnits )
+			{
+				ScheduleBotTeamLoss( nLosingTeam );
+				return bOutcomeKnown;
+			}
+		}
 	}
 	return false;
 }
@@ -545,7 +622,8 @@ void CMPManagerMode::AnalyzeLaggers()
 	uint32_t dwPlayers = 0;
 	for ( int i = 0; i < slots.size(); ++i )
 	{
-		if ( IsPlayerPresent( i ) )
+		// Bots can't vote to kick a lagging player, so they must not be waited on to reach a majority.
+		if ( IsPlayerPresent( i ) && !slots[i].bBot )
 		{
 			dwPlayers |= ( 1UL << i );
 		}

@@ -488,6 +488,7 @@ class CScenarioTrackerMultiplayer : public IScenarioTracker
 				ZSKIP //CDBPtr<NDb::SBackground> pUnitFullInfoColor;
 						SPlayerColor playerColor;
 		int nReinforcementCallsUsed = {};
+		bool bBot = {};
 
 		ZEND int operator&( IBinSaver &f )
 		{
@@ -502,6 +503,7 @@ class CScenarioTrackerMultiplayer : public IScenarioTracker
 			f.Add( 11, &leaderLevels );
 			f.Add( 14, &playerColor );
 			f.Add( 15, &nReinforcementCallsUsed );
+			f.Add( 16, &bBot );
 			return 0;
 		}
 
@@ -884,6 +886,8 @@ public:
 	void SetPlayerSide( const int nPlayer, const int nNewTeam ) override;
 	const NDb::SReinforcement *GetStartUnits( int nPlayer ) const override;
 	void SetPlayerColour( const int nPlayer, const int nNewColour ) override;
+	void SetPlayerBot( const int nPlayer, const bool bBot ) override;
+	bool IsPlayerBot( const int nPlayer ) const override;
 
 	// Leaders (commanders)
 	const SLeaderInfo *GetLeaderInfo( const NDb::EReinforcementType eReinf ) const override;

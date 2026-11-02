@@ -351,6 +351,7 @@ bool CCommandsHistory::LoadHistory( const std::string &szFileName )
 		pScenarioTracker->SetPlayerSide( i, slot.nTeam );
 		pScenarioTracker->SetPlayerParty( i, slot.nCountry );
 		pScenarioTracker->SetPlayerColour( i, slot.nColour );
+		pScenarioTracker->SetPlayerBot( i, slot.bBot );
 
 		scenarioInfo.players.push_back( IScenarioTracker::SMultiplayerInfo::SPlayer() );
 		IScenarioTracker::SMultiplayerInfo::SPlayer &scenarioPlayer = scenarioInfo.players.back();

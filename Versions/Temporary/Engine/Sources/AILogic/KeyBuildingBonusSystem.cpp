@@ -29,6 +29,15 @@ bool CKeyBuildingBonusSystem::IsStorage( int nLinkID ) const
 	return pos != buildingBonuses.end() && pos->second.bStorage;
 }
 
+void CKeyBuildingBonusSystem::GetKeyBuildingLinks( std::vector<int> *pLinks ) const
+{
+	pLinks->clear();
+	for ( CBuildingBonuses::const_iterator it = buildingBonuses.begin(); it != buildingBonuses.end(); ++it )
+	{
+		pLinks->push_back( it->first );
+	}
+}
+
 bool CKeyBuildingBonusSystem::IsKeyBuilding( int nLinkID ) const
 {
 	CBuildingBonuses::const_iterator pos = buildingBonuses.find( nLinkID );

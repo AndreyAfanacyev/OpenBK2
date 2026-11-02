@@ -64,6 +64,7 @@ class CGeneral : public CCommander, public IEnemyContainer
 	uint8_t cBombardmentType = {};
 	bool bSendReserves = {}; // send tanks to swarm
 	int nMaxAllowedMobileTanks = {};
+	int nPlayer = -1; // equal to nParty in single player; a net game side can hold several bots
 
 public:
 	ZEND int operator&( IBinSaver &f ) override
@@ -92,6 +93,7 @@ public:
 		f.Add( 21, &cBombardmentType );
 		f.Add( 22, &bSendReserves );
 		f.Add( 23, &nMaxAllowedMobileTanks );
+		f.Add( 24, &nPlayer );
 		return 0;
 	}
 
@@ -134,6 +136,17 @@ public:
 
 	CGeneral( const int _nParty )
 		: nParty( _nParty )
+		, nPlayer( _nParty )
+		, lastBombardmentCheck( 0 )
+		, timeNextUpdate( 1000 )
+		, nAirReinfTurnCounter( 0 )
+	{
+		curProcessed = enemys.end();
+	}
+
+	CGeneral( const int _nParty, const int _nPlayer )
+		: nParty( _nParty )
+		, nPlayer( _nPlayer )
 		, lastBombardmentCheck( 0 )
 		, timeNextUpdate( 1000 )
 		, nAirReinfTurnCounter( 0 )
@@ -203,5 +216,10 @@ public:
 	int GetParty() const
 	{
 		return nParty;
+	}
+
+	int GetPlayer() const
+	{
+		return nPlayer;
 	}
 };

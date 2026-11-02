@@ -18,10 +18,12 @@ void CDiplomacy::Load( const std::vector<int> &_playerParty )
 	playerParty = _playerParty;
 	isPlayerExist.clear();
 	isPlayerExist.resize( playerParty.size(), 0 );
+	isPlayerBot.assign( playerParty.size(), 0 );
 
 	for ( int i = 0; i < isPlayerExist.size(); ++i )
 	{
 		isPlayerExist[i] = GetScenarioTracker()->IsPlayerPresent( i );
+		isPlayerBot[i] = isPlayerExist[i] && GetScenarioTracker()->IsPlayerBot( i );
 		if ( GetScenarioTracker()->IsMissionActive() )
 		{
 			int nScenarioParty = GetScenarioTracker()->GetPlayerSide( i );
@@ -58,6 +60,7 @@ int CDiplomacy::operator&( IBinSaver &saver )
 		saver.Add( 2, &nMyNumber );
 		saver.Add( 3, &bNetGame );
 		saver.Add( 4, &isPlayerExist );
+		saver.Add( 5, &isPlayerBot );
 	}
 
 	return 0;
